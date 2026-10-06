@@ -63,5 +63,5 @@
     "all": "npm run format && npm run lint && npm run package && npm test"
   },
   "type": "module",
-  "version": "3.0.2"
+  "version": "3.1.3"
 }

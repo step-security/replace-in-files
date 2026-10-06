@@ -1,0 +1,7 @@
+[[IgnoredVulns]]
+id = "GHSA-vfj7-8cjw-p6xm"
+reason = "braces is a dev-only transitive dependency (ts-jest-resolver > jest-resolve > micromatch), not bundled into dist. No fixed version available."
+
+[[IgnoredVulns]]
+id = "GHSA-hp3w-g68c-fv3c"
+reason = "sprintf-js is a dev-only transitive dependency (ts-jest > @istanbuljs/load-nyc-config > js-yaml > argparse), not bundled into dist. No fixed version available."
