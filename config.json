@@ -1,13 +1,17 @@
 {
- "onboarding_type": "copied",
- "is_archived": false,
- "maintained_action_name": "step-security/replace-in-files",
- "upstream_full_action_name": "richardrigutins/replace-in-files",
- "action_type": "node",
- "current_version": "v3.1.3",
- "sync_config": {
-  "ignore_presets": [
-   "defaults_v1"
-  ]
- }
+  "$comment": "Managed automatically when syncing with upstream. Do not edit by hand.",
+  "schema_version": 1,
+  "onboarding_type": "copied",
+  "action_type": "node",
+  "upstream": {
+    "repository": "richardrigutins/replace-in-files",
+    "synced_tag": "v3.1.6",
+    "synced_commit": "3ad19babce615231ae704de7a34dd014f7686c6d",
+    "archived": false
+  },
+  "build": {
+    "package_manager": "npm@11.19.1",
+    "node_version": "24",
+    "script": "package"
+  }
 }
