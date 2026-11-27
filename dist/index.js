@@ -19,7 +19,7 @@ import require$$0$1 from 'node:buffer';
 import require$$0$5 from 'node:util';
 import require$$7 from 'node:querystring';
 import require$$8, { EventEmitter } from 'node:events';
-import require$$0$6 from 'node:diagnostics_channel';
+import require$$0$6, { channel, tracingChannel } from 'node:diagnostics_channel';
 import require$$5 from 'node:tls';
 import require$$1$3 from 'node:zlib';
 import require$$5$1 from 'node:perf_hooks';
@@ -33,11 +33,11 @@ import require$$5$3 from 'string_decoder';
 import 'child_process';
 import 'timers';
 import { win32, posix } from 'node:path';
-import * as xi from 'node:fs';
+import * as Qi from 'node:fs';
 import { realpath, readlink, readdir as readdir$1, lstat as lstat$1 } from 'node:fs/promises';
 import { StringDecoder } from 'node:string_decoder';
 import stream, { Readable } from 'stream';
-import require$$5$4 from 'url';
+import require$$5$4, { domainToASCII } from 'url';
 import require$$1$7 from 'tty';
 import http2 from 'http2';
 import zlib from 'zlib';
@@ -2755,6 +2755,7 @@ function requireDispatcherBase () {
 	if (hasRequiredDispatcherBase) return dispatcherBase;
 	hasRequiredDispatcherBase = 1;
 
+	const buffer = require$$0$1;
 	const Dispatcher = requireDispatcher();
 	const {
 	  ClientDestroyedError,
@@ -2767,6 +2768,7 @@ function requireDispatcherBase () {
 	const kOnClosed = Symbol('onClosed');
 	const kInterceptedDispatch = Symbol('Intercepted Dispatch');
 	const kWebSocketOptions = Symbol('webSocketOptions');
+	const kEventSourceOptions = Symbol('eventSourceOptions');
 
 	class DispatcherBase extends Dispatcher {
 	  constructor (opts) {
@@ -2777,12 +2779,19 @@ function requireDispatcherBase () {
 	    this[kClosed] = false;
 	    this[kOnClosed] = [];
 	    this[kWebSocketOptions] = opts?.webSocket ?? {};
+	    this[kEventSourceOptions] = opts?.eventSource ?? {};
 	  }
 
 	  get webSocketOptions () {
 	    return {
 	      maxFragments: this[kWebSocketOptions].maxFragments ?? 131072,
 	      maxPayloadSize: this[kWebSocketOptions].maxPayloadSize ?? 128 * 1024 * 1024
+	    }
+	  }
+
+	  get eventSourceOptions () {
+	    return {
+	      maxEventSize: this[kEventSourceOptions].maxEventSize ?? buffer.kStringMaxLength
 	    }
 	  }
 
@@ -9403,8 +9412,6 @@ function requireClientH1 () {
 	  socket[kParser] = new Parser(client, socket, llhttpInstance);
 
 	  addListener(socket, 'error', function (err) {
-	    assert(err.code !== 'ERR_TLS_CERT_ALTNAME_INVALID');
-
 	    const parser = this[kParser];
 
 	    // On Mac OS, we get an ECONNRESET even if there is a full body to be forwarded
@@ -10335,8 +10342,6 @@ function requireClientH2 () {
 	  socket[kHTTP2Session] = session;
 
 	  util.addListener(socket, 'error', function (err) {
-	    assert(err.code !== 'ERR_TLS_CERT_ALTNAME_INVALID');
-
 	    this[kError] = err;
 
 	    this[kClient][kOnError](err);
@@ -10410,8 +10415,6 @@ function requireClientH2 () {
 	}
 
 	function onHttp2SessionError (err) {
-	  assert(err.code !== 'ERR_TLS_CERT_ALTNAME_INVALID');
-
 	  this[kSocket][kError] = err;
 	  this[kClient][kOnError](err);
 	}
@@ -11359,9 +11362,10 @@ function requireClient () {
 	    // h2
 	    maxConcurrentStreams,
 	    allowH2,
-	    webSocket
+	    webSocket,
+	    eventSource
 	  } = {}) {
-	    super({ webSocket });
+	    super({ webSocket, eventSource });
 
 	    if (keepAlive !== undefined) {
 	      throw new InvalidArgumentError('unsupported keepAlive, use pipelining=0 instead')
@@ -12606,7 +12610,7 @@ function requireAgent$1 () {
 	}
 
 	class Agent extends DispatcherBase {
-	  constructor ({ factory = defaultFactory, maxRedirections = 0, connect, ...options } = {}) {
+	  constructor ({ factory = defaultFactory, maxRedirections = 0, connect, tls, ...options } = {}) {
 	    if (typeof factory !== 'function') {
 	      throw new InvalidArgumentError('factory must be a function.')
 	    }
@@ -12625,11 +12629,15 @@ function requireAgent$1 () {
 	      connect = { ...connect };
 	    }
 
+	    if (tls && typeof tls !== 'function') {
+	      tls = { ...tls };
+	    }
+
 	    this[kInterceptors] = options.interceptors?.Agent && Array.isArray(options.interceptors.Agent)
 	      ? options.interceptors.Agent
 	      : [createRedirectInterceptor({ maxRedirections })];
 
-	    this[kOptions] = { ...util.deepClone(options), connect };
+	    this[kOptions] = { ...util.deepClone(options), connect, tls };
 	    this[kOptions].interceptors = options.interceptors
 	      ? { ...options.interceptors }
 	      : undefined;
@@ -21172,8 +21180,10 @@ function requireFetch () {
 	  // 19. Run these steps in parallel:
 
 	  //    1. Run these steps, but abort when fetchParams is canceled:
-	  fetchParams.controller.onAborted = onAborted;
-	  fetchParams.controller.on('terminated', onAborted);
+	  if (!fetchParams.controller.resume) {
+	    fetchParams.controller.on('terminated', onAborted);
+	  }
+
 	  fetchParams.controller.resume = async () => {
 	    // 1. While true
 	    while (true) {
@@ -21342,8 +21352,6 @@ function requireFetch () {
 	          }
 	          location = headersList.get('location', true);
 
-	          this.body = new Readable({ read: resume });
-
 	          const decoders = [];
 
 	          const willFollow = location && request.redirect === 'follow' &&
@@ -21361,7 +21369,7 @@ function requireFetch () {
 	            // CVE fix similar to urllib3 (GHSA-gm62-xv2j-4w53) and curl (CVE-2022-32206).
 	            const maxContentEncodings = 5;
 	            if (codings.length > maxContentEncodings) {
-	              reject(new Error(`too many content-encodings in response: ${codings.length}, maximum allowed is ${maxContentEncodings}`));
+	              this.abort(new Error(`too many content-encodings in response: ${codings.length}, maximum allowed is ${maxContentEncodings}`));
 	              return true
 	            }
 
@@ -21393,6 +21401,8 @@ function requireFetch () {
 	              }
 	            }
 	          }
+
+	          this.body = new Readable({ read: resume });
 
 	          const onError = this.onError.bind(this);
 
@@ -21438,10 +21448,6 @@ function requireFetch () {
 	        onComplete () {
 	          if (this.abort) {
 	            fetchParams.controller.off('terminated', this.abort);
-	          }
-
-	          if (fetchParams.controller.onAborted) {
-	            fetchParams.controller.off('terminated', fetchParams.controller.onAborted);
 	          }
 
 	          fetchParams.controller.ended = true;
@@ -26241,6 +26247,20 @@ function requireReceiver () {
 	        if (isControlFrame(this.#info.opcode)) {
 	          this.#loop = this.parseControlFrame(body);
 	          this.#state = parserStates.INFO;
+
+	          // If the automatic PONG/CLOSE reply filled the socket's write buffer,
+	          // stop parsing and resume on drain so a PING flood cannot grow the
+	          // outbound queue without bound.
+	          const socket = this.ws[kResponse].socket;
+	          if (this.#loop && socket.writableNeedDrain) {
+	            this.#loop = false;
+	            socket.once('drain', () => {
+	              if (this.destroyed) return
+	              this.#loop = true;
+	              this.run(callback);
+	            });
+	            return
+	          }
 	        } else {
 	          if (!this.#info.compressed) {
 	            if (!this.writeFragments(body)) {
@@ -27272,6 +27292,7 @@ var hasRequiredEventsourceStream;
 function requireEventsourceStream () {
 	if (hasRequiredEventsourceStream) return eventsourceStream;
 	hasRequiredEventsourceStream = 1;
+	const buffer = require$$0$1;
 	const { Transform } = require$$0$3;
 	const { isASCIINumber, isValidLastEventId } = requireUtil();
 
@@ -27296,10 +27317,18 @@ function requireEventsourceStream () {
 	 */
 	const SPACE = 0x20;
 
+	const defaultMaxEventSize = buffer.kStringMaxLength;
+
 	const DATA = Buffer.from('data');
 	const EVENT = Buffer.from('event');
 	const ID = Buffer.from('id');
 	const RETRY = Buffer.from('retry');
+
+	// Each data field creates a string node, and each unconsumed input chunk keeps
+	// a Buffer wrapper. The absolute ceiling protects the large default byte limit.
+	const minParserItems = 1024;
+	const maxParserItems = 131072;
+	const bytesPerParserItem = 128;
 
 	function isASCIINumberBytes (buffer, start) {
 	  if (start >= buffer.length) {
@@ -27337,6 +27366,12 @@ function requireEventsourceStream () {
 	  }
 
 	  return true
+	}
+
+	function createMaxEventSizeExceededError () {
+	  const error = new Error('EventSource message size exceeded');
+	  error.aborted = false;
+	  return error
 	}
 
 	/**
@@ -27387,6 +27422,13 @@ function requireEventsourceStream () {
 	  pos = 0
 	  lineChunkIndex = 0
 	  linePos = 0
+	  lineLength = 0
+	  eventSize = 0
+	  eventFieldSizes = { data: 0, event: 0, id: 0, retry: 0 }
+	  dataLineCount = 0
+	  maxEventSize
+	  maxDataLines
+	  maxBufferedChunks
 
 	  event = {
 	    data: undefined,
@@ -27397,6 +27439,7 @@ function requireEventsourceStream () {
 
 	  /**
 	   * @param {object} options
+	   * @param {number} [options.maxEventSize]
 	   * @param {eventSourceSettings} options.eventSourceSettings
 	   * @param {Function} [options.push]
 	   */
@@ -27408,6 +27451,12 @@ function requireEventsourceStream () {
 	    super(options);
 
 	    this.state = options.eventSourceSettings || {};
+	    this.maxEventSize = options.maxEventSize ?? defaultMaxEventSize;
+	    const parserItemLimit = this.maxEventSize > 0
+	      ? Math.min(maxParserItems, Math.max(minParserItems, Math.floor(this.maxEventSize / bytesPerParserItem)))
+	      : 0;
+	    this.maxDataLines = parserItemLimit;
+	    this.maxBufferedChunks = parserItemLimit;
 	    if (options.push) {
 	      this.push = options.push;
 	    }
@@ -27425,6 +27474,14 @@ function requireEventsourceStream () {
 	      return
 	    }
 
+	    // A leading line ending can immediately release the currently buffered
+	    // line, even when it uses the final allowed chunk slot.
+	    if (this.maxEventSize > 0 &&
+	        this.chunks.length >= this.maxBufferedChunks &&
+	        chunk[0] !== LF && chunk[0] !== CR) {
+	      callback(createMaxEventSizeExceededError());
+	      return
+	    }
 	    this.chunks.push(chunk);
 
 	    // Strip leading byte-order-mark if we opened the stream and started
@@ -27503,7 +27560,12 @@ function requireEventsourceStream () {
 
 	        // In any case, we can process the line as we reached an
 	        // end-of-line character
-	        this.parseLine(this.readLine(), this.event);
+	        try {
+	          this.parseLine(this.readLine(), this.event);
+	        } catch (error) {
+	          callback(error);
+	          return
+	        }
 	        this.consumeCurrentByte();
 	        // A line was processed and this could be the end of the event. We need
 	        // to check if the next line is empty to determine if the event is
@@ -27512,15 +27574,28 @@ function requireEventsourceStream () {
 	        continue
 	      }
 
+	      // readLine() is only called after CR or LF. Reject an unfinished line
+	      // before it can retain an unbounded number of decoded chunks. The seven
+	      // extra bytes allow the longest field prefix ("event: " or "retry: ").
+	      if (this.maxEventSize > 0 && ++this.lineLength > this.maxEventSize + 7) {
+	        callback(createMaxEventSizeExceededError());
+	        return
+	      }
 	      this.advanceCursor();
 	    }
 
 	    callback();
 	  }
 
+	  _destroy (error, callback) {
+	    this.chunks.length = 0;
+	    this.clearEvent();
+	    super._destroy(error, callback);
+	  }
+
 	  /**
 	   * @param {Buffer} line
-	   * @param {EventStreamEvent} event
+	   * @param {EventSourceStreamEvent} event
 	   */
 	  parseLine (line, event) {
 	    // If the line is empty (a blank line)
@@ -27554,6 +27629,13 @@ function requireEventsourceStream () {
 	    }
 
 	    if (isFieldName(line, fieldLength, DATA)) {
+	      if (this.maxEventSize > 0 && this.dataLineCount >= this.maxDataLines) {
+	        throw createMaxEventSizeExceededError()
+	      }
+	      const valueBytes = line.length - valueStart;
+	      const dataSize = this.eventFieldSizes.data + (event.data === undefined ? 0 : 1) + valueBytes;
+	      this.setEventFieldSize('data', dataSize);
+
 	      const value = line.toString('utf8', valueStart);
 
 	      if (event.data === undefined) {
@@ -27561,11 +27643,13 @@ function requireEventsourceStream () {
 	      } else {
 	        event.data += `\n${value}`;
 	      }
+	      this.dataLineCount++;
 	      return
 	    }
 
 	    if (isFieldName(line, fieldLength, RETRY)) {
 	      if (isASCIINumberBytes(line, valueStart)) {
+	        this.setEventFieldSize('retry', line.length - valueStart);
 	        event.retry = line.toString('utf8', valueStart);
 	      }
 	      return
@@ -27573,18 +27657,27 @@ function requireEventsourceStream () {
 
 	    if (isFieldName(line, fieldLength, ID)) {
 	      if (isValidLastEventIdBytes(line, valueStart)) {
+	        this.setEventFieldSize('id', line.length - valueStart);
 	        event.id = line.toString('utf8', valueStart);
 	      }
 	      return
 	    }
 
 	    if (isFieldName(line, fieldLength, EVENT)) {
-	      const value = line.toString('utf8', valueStart);
-
-	      if (value.length > 0) {
-	        event.event = value;
+	      if (valueStart < line.length) {
+	        this.setEventFieldSize('event', line.length - valueStart);
+	        event.event = line.toString('utf8', valueStart);
 	      }
 	    }
+	  }
+
+	  setEventFieldSize (field, size) {
+	    const eventSize = this.eventSize - this.eventFieldSizes[field] + size;
+	    if (this.maxEventSize > 0 && eventSize > this.maxEventSize) {
+	      throw createMaxEventSizeExceededError()
+	    }
+	    this.eventSize = eventSize;
+	    this.eventFieldSizes[field] = size;
 	  }
 
 	  /**
@@ -27617,6 +27710,12 @@ function requireEventsourceStream () {
 	    this.event.event = undefined;
 	    this.event.id = undefined;
 	    this.event.retry = undefined;
+	    this.eventSize = 0;
+	    this.dataLineCount = 0;
+	    this.eventFieldSizes.data = 0;
+	    this.eventFieldSizes.event = 0;
+	    this.eventFieldSizes.id = 0;
+	    this.eventFieldSizes.retry = 0;
 	  }
 
 	  hasPendingEvent () {
@@ -27652,14 +27751,16 @@ function requireEventsourceStream () {
 	  syncLineStartToCursor () {
 	    this.lineChunkIndex = this.chunkIndex;
 	    this.linePos = this.pos;
+	    this.lineLength = 0;
 	    this.dropConsumedChunks();
 	  }
 
 	  dropConsumedChunks () {
-	    while (this.lineChunkIndex > 0) {
-	      this.chunks.shift();
-	      this.lineChunkIndex--;
-	      this.chunkIndex--;
+	    if (this.lineChunkIndex > 0) {
+	      const consumed = this.lineChunkIndex;
+	      this.chunks.splice(0, consumed);
+	      this.lineChunkIndex = 0;
+	      this.chunkIndex -= consumed;
 	    }
 
 	    if (this.chunkIndex === this.chunks.length) {
@@ -27785,6 +27886,7 @@ function requireEventsource () {
 	const { delay } = requireUtil();
 	const { kEnumerableProperty } = requireUtil$7();
 	const { environmentSettingsObject } = requireUtil$6();
+	const { getGlobalDispatcher } = requireGlobal();
 
 	let experimentalWarned = false;
 
@@ -28066,6 +28168,7 @@ function requireEventsource () {
 
 	      const eventSourceStream = new EventSourceStream({
 	        eventSourceSettings: this.#state,
+	        maxEventSize: this.#dispatcher.eventSourceOptions?.maxEventSize,
 	        push: (event) => {
 	          this.dispatchEvent(createFastMessageEvent(
 	            event.type,
@@ -28244,7 +28347,8 @@ function requireEventsource () {
 	  },
 	  {
 	    key: 'dispatcher', // undici only
-	    converter: webidl.converters.any
+	    converter: webidl.converters.any,
+	    defaultValue: () => getGlobalDispatcher()
 	  }
 	]);
 
@@ -28663,9 +28767,8 @@ function info(message) {
     process.stdout.write(message + os$1.EOL);
 }
 
-var Gt=(n,t,e)=>{let s=n instanceof RegExp?ce(n,e):n,i=t instanceof RegExp?ce(t,e):t,r=s!==null&&i!=null&&ss(s,i,e);return r&&{start:r[0],end:r[1],pre:e.slice(0,r[0]),body:e.slice(r[0]+s.length,r[1]),post:e.slice(r[1]+i.length)}},ce=(n,t)=>{let e=t.match(n);return e?e[0]:null},ss=(n,t,e)=>{let s,i,r,o,h,a=e.indexOf(n),l=e.indexOf(t,a+1),u=a;if(a>=0&&l>0){if(n===t)return [a,l];for(s=[],r=e.length;u>=0&&!h;){if(u===a)s.push(u),a=e.indexOf(n,u+1);else if(s.length===1){let c=s.pop();c!==void 0&&(h=[c,l]);}else i=s.pop(),i!==void 0&&i<r&&(r=i,o=l),l=e.indexOf(t,u+1);u=a<l&&a>=0?a:l;}s.length&&o!==void 0&&(h=[r,o]);}return h};var fe="\0SLASH"+Math.random()+"\0",ue="\0OPEN"+Math.random()+"\0",qt="\0CLOSE"+Math.random()+"\0",de="\0COMMA"+Math.random()+"\0",pe="\0PERIOD"+Math.random()+"\0",is=new RegExp(fe,"g"),rs=new RegExp(ue,"g"),ns=new RegExp(qt,"g"),os=new RegExp(de,"g"),hs=new RegExp(pe,"g"),as=/\\\\/g,ls=/\\{/g,cs=/\\}/g,fs=/\\,/g,us=/\\./g,ds=1e5;function Ht(n){return isNaN(n)?n.charCodeAt(0):parseInt(n,10)}function ps(n){return n.replace(as,fe).replace(ls,ue).replace(cs,qt).replace(fs,de).replace(us,pe)}function ms$1(n){return n.replace(is,"\\").replace(rs,"{").replace(ns,"}").replace(os,",").replace(hs,".")}function me(n){if(!n)return [""];let t=[],e=Gt("{","}",n);if(!e)return n.split(",");let{pre:s,body:i,post:r}=e,o=s.split(",");o[o.length-1]+="{"+i+"}";let h=me(r);return r.length&&(o[o.length-1]+=h.shift(),o.push.apply(o,h)),t.push.apply(t,o),t}function ge(n,t={}){if(!n)return [];let{max:e=ds}=t;return n.slice(0,2)==="{}"&&(n="\\{\\}"+n.slice(2)),ht(ps(n),e,true).map(ms$1)}function gs(n){return "{"+n+"}"}function ws(n){return /^-?0\d/.test(n)}function ys(n,t){return n<=t}function bs(n,t){return n>=t}function ht(n,t,e){let s=[],i=Gt("{","}",n);if(!i)return [n];let r=i.pre,o=i.post.length?ht(i.post,t,false):[""];if(/\$$/.test(i.pre))for(let h=0;h<o.length&&h<t;h++){let a=r+"{"+i.body+"}"+o[h];s.push(a);}else {let h=/^-?\d+\.\.-?\d+(?:\.\.-?\d+)?$/.test(i.body),a=/^[a-zA-Z]\.\.[a-zA-Z](?:\.\.-?\d+)?$/.test(i.body),l=h||a,u=i.body.indexOf(",")>=0;if(!l&&!u)return i.post.match(/,(?!,).*\}/)?(n=i.pre+"{"+i.body+qt+i.post,ht(n,t,true)):[n];let c;if(l)c=i.body.split(/\.\./);else if(c=me(i.body),c.length===1&&c[0]!==void 0&&(c=ht(c[0],t,false).map(gs),c.length===1))return o.map(f=>i.pre+c[0]+f);let d;if(l&&c[0]!==void 0&&c[1]!==void 0){let f=Ht(c[0]),m=Ht(c[1]),p=Math.max(c[0].length,c[1].length),w=c.length===3&&c[2]!==void 0?Math.abs(Ht(c[2])):1,g=ys;m<f&&(w*=-1,g=bs);let E=c.some(ws);d=[];for(let y=f;g(y,m);y+=w){let b;if(a)b=String.fromCharCode(y),b==="\\"&&(b="");else if(b=String(y),E){let z=p-b.length;if(z>0){let $=new Array(z+1).join("0");y<0?b="-"+$+b.slice(1):b=$+b;}}d.push(b);}}else {d=[];for(let f=0;f<c.length;f++)d.push.apply(d,ht(c[f],t,false));}for(let f=0;f<d.length;f++)for(let m=0;m<o.length&&s.length<t;m++){let p=r+d[f]+o[m];(!e||l||p)&&s.push(p);}}return s}var at=n=>{if(typeof n!="string")throw new TypeError("invalid pattern");if(n.length>65536)throw new TypeError("pattern is too long")};var Ss={"[:alnum:]":["\\p{L}\\p{Nl}\\p{Nd}",true],"[:alpha:]":["\\p{L}\\p{Nl}",true],"[:ascii:]":["\\x00-\\x7f",false],"[:blank:]":["\\p{Zs}\\t",true],"[:cntrl:]":["\\p{Cc}",true],"[:digit:]":["\\p{Nd}",true],"[:graph:]":["\\p{Z}\\p{C}",true,true],"[:lower:]":["\\p{Ll}",true],"[:print:]":["\\p{C}",true],"[:punct:]":["\\p{P}",true],"[:space:]":["\\p{Z}\\t\\r\\n\\v\\f",true],"[:upper:]":["\\p{Lu}",true],"[:word:]":["\\p{L}\\p{Nl}\\p{Nd}\\p{Pc}",true],"[:xdigit:]":["A-Fa-f0-9",false]},lt=n=>n.replace(/[[\]\\-]/g,"\\$&"),Es=n=>n.replace(/[-[\]{}()*+?.,\\^$|#\s]/g,"\\$&"),we=n=>n.join(""),ye=(n,t)=>{let e=t;if(n.charAt(e)!=="[")throw new Error("not in a brace expression");let s=[],i=[],r=e+1,o=false,h=false,a=false,l=false,u=e,c="";t:for(;r<n.length;){let p=n.charAt(r);if((p==="!"||p==="^")&&r===e+1){l=true,r++;continue}if(p==="]"&&o&&!a){u=r+1;break}if(o=true,p==="\\"&&!a){a=true,r++;continue}if(p==="["&&!a){for(let[w,[g,S,E]]of Object.entries(Ss))if(n.startsWith(w,r)){if(c)return ["$.",false,n.length-e,true];r+=w.length,E?i.push(g):s.push(g),h=h||S;continue t}}if(a=false,c){p>c?s.push(lt(c)+"-"+lt(p)):p===c&&s.push(lt(p)),c="",r++;continue}if(n.startsWith("-]",r+1)){s.push(lt(p+"-")),r+=2;continue}if(n.startsWith("-",r+1)){c=p,r+=2;continue}s.push(lt(p)),r++;}if(u<r)return ["",false,0,false];if(!s.length&&!i.length)return ["$.",false,n.length-e,true];if(i.length===0&&s.length===1&&/^\\?.$/.test(s[0])&&!l){let p=s[0].length===2?s[0].slice(-1):s[0];return [Es(p),false,u-e,false]}let d="["+(l?"^":"")+we(s)+"]",f="["+(l?"":"^")+we(i)+"]";return [s.length&&i.length?"("+d+"|"+f+")":s.length?d:f,h,u-e,true]};var W=(n,{windowsPathsNoEscape:t=false,magicalBraces:e=true}={})=>e?t?n.replace(/\[([^\/\\])\]/g,"$1"):n.replace(/((?!\\).|^)\[([^\/\\])\]/g,"$1$2").replace(/\\([^\/])/g,"$1"):t?n.replace(/\[([^\/\\{}])\]/g,"$1"):n.replace(/((?!\\).|^)\[([^\/\\{}])\]/g,"$1$2").replace(/\\([^\/{}])/g,"$1");var xs=new Set(["!","?","+","*","@"]),be=n=>xs.has(n),vs="(?!(?:^|/)\\.\\.?(?:$|/))",Ct="(?!\\.)",Cs=new Set(["[","."]),Ts=new Set(["..","."]),As=new Set("().*{}+?[]^$\\!"),ks=n=>n.replace(/[-[\]{}()*+?.,\\^$|#\s]/g,"\\$&"),Kt="[^/]",Se=Kt+"*?",Ee=Kt+"+?",Q=class n{type;#t;#s;#n=false;#r=[];#o;#S;#w;#c=false;#h;#u;#f=false;constructor(t,e,s={}){this.type=t,t&&(this.#s=true),this.#o=e,this.#t=this.#o?this.#o.#t:this,this.#h=this.#t===this?s:this.#t.#h,this.#w=this.#t===this?[]:this.#t.#w,t==="!"&&!this.#t.#c&&this.#w.push(this),this.#S=this.#o?this.#o.#r.length:0;}get hasMagic(){if(this.#s!==void 0)return this.#s;for(let t of this.#r)if(typeof t!="string"&&(t.type||t.hasMagic))return this.#s=true;return this.#s}toString(){return this.#u!==void 0?this.#u:this.type?this.#u=this.type+"("+this.#r.map(t=>String(t)).join("|")+")":this.#u=this.#r.map(t=>String(t)).join("")}#a(){if(this!==this.#t)throw new Error("should only call on root");if(this.#c)return this;this.toString(),this.#c=true;let t;for(;t=this.#w.pop();){if(t.type!=="!")continue;let e=t,s=e.#o;for(;s;){for(let i=e.#S+1;!s.type&&i<s.#r.length;i++)for(let r of t.#r){if(typeof r=="string")throw new Error("string part in extglob AST??");r.copyIn(s.#r[i]);}e=s,s=e.#o;}}return this}push(...t){for(let e of t)if(e!==""){if(typeof e!="string"&&!(e instanceof n&&e.#o===this))throw new Error("invalid part: "+e);this.#r.push(e);}}toJSON(){let t=this.type===null?this.#r.slice().map(e=>typeof e=="string"?e:e.toJSON()):[this.type,...this.#r.map(e=>e.toJSON())];return this.isStart()&&!this.type&&t.unshift([]),this.isEnd()&&(this===this.#t||this.#t.#c&&this.#o?.type==="!")&&t.push({}),t}isStart(){if(this.#t===this)return  true;if(!this.#o?.isStart())return  false;if(this.#S===0)return  true;let t=this.#o;for(let e=0;e<this.#S;e++){let s=t.#r[e];if(!(s instanceof n&&s.type==="!"))return  false}return  true}isEnd(){if(this.#t===this||this.#o?.type==="!")return  true;if(!this.#o?.isEnd())return  false;if(!this.type)return this.#o?.isEnd();let t=this.#o?this.#o.#r.length:0;return this.#S===t-1}copyIn(t){typeof t=="string"?this.push(t):this.push(t.clone(this));}clone(t){let e=new n(this.type,t);for(let s of this.#r)e.copyIn(s);return e}static#i(t,e,s,i){let r=false,o=false,h=-1,a=false;if(e.type===null){let f=s,m="";for(;f<t.length;){let p=t.charAt(f++);if(r||p==="\\"){r=!r,m+=p;continue}if(o){f===h+1?(p==="^"||p==="!")&&(a=true):p==="]"&&!(f===h+2&&a)&&(o=false),m+=p;continue}else if(p==="["){o=true,h=f,a=false,m+=p;continue}if(!i.noext&&be(p)&&t.charAt(f)==="("){e.push(m),m="";let w=new n(p,e);f=n.#i(t,w,f,i),e.push(w);continue}m+=p;}return e.push(m),f}let l=s+1,u=new n(null,e),c=[],d="";for(;l<t.length;){let f=t.charAt(l++);if(r||f==="\\"){r=!r,d+=f;continue}if(o){l===h+1?(f==="^"||f==="!")&&(a=true):f==="]"&&!(l===h+2&&a)&&(o=false),d+=f;continue}else if(f==="["){o=true,h=l,a=false,d+=f;continue}if(be(f)&&t.charAt(l)==="("){u.push(d),d="";let m=new n(f,u);u.push(m),l=n.#i(t,m,l,i);continue}if(f==="|"){u.push(d),d="",c.push(u),u=new n(null,e);continue}if(f===")")return d===""&&e.#r.length===0&&(e.#f=true),u.push(d),d="",e.push(...c,u),l;d+=f;}return e.type=null,e.#s=void 0,e.#r=[t.substring(s-1)],l}static fromGlob(t,e={}){let s=new n(null,void 0,e);return n.#i(t,s,0,e),s}toMMPattern(){if(this!==this.#t)return this.#t.toMMPattern();let t=this.toString(),[e,s,i,r]=this.toRegExpSource();if(!(i||this.#s||this.#h.nocase&&!this.#h.nocaseMagicOnly&&t.toUpperCase()!==t.toLowerCase()))return s;let h=(this.#h.nocase?"i":"")+(r?"u":"");return Object.assign(new RegExp(`^${e}$`,h),{_src:e,_glob:t})}get options(){return this.#h}toRegExpSource(t){let e=t??!!this.#h.dot;if(this.#t===this&&this.#a(),!this.type){let a=this.isStart()&&this.isEnd()&&!this.#r.some(f=>typeof f!="string"),l=this.#r.map(f=>{let[m,p,w,g]=typeof f=="string"?n.#E(f,this.#s,a):f.toRegExpSource(t);return this.#s=this.#s||w,this.#n=this.#n||g,m}).join(""),u="";if(this.isStart()&&typeof this.#r[0]=="string"&&!(this.#r.length===1&&Ts.has(this.#r[0]))){let m=Cs,p=e&&m.has(l.charAt(0))||l.startsWith("\\.")&&m.has(l.charAt(2))||l.startsWith("\\.\\.")&&m.has(l.charAt(4)),w=!e&&!t&&m.has(l.charAt(0));u=p?vs:w?Ct:"";}let c="";return this.isEnd()&&this.#t.#c&&this.#o?.type==="!"&&(c="(?:$|\\/)"),[u+l+c,W(l),this.#s=!!this.#s,this.#n]}let s=this.type==="*"||this.type==="+",i=this.type==="!"?"(?:(?!(?:":"(?:",r=this.#d(e);if(this.isStart()&&this.isEnd()&&!r&&this.type!=="!"){let a=this.toString();return this.#r=[a],this.type=null,this.#s=void 0,[a,W(this.toString()),false,false]}let o=!s||t||e||!Ct?"":this.#d(true);o===r&&(o=""),o&&(r=`(?:${r})(?:${o})*?`);let h="";if(this.type==="!"&&this.#f)h=(this.isStart()&&!e?Ct:"")+Ee;else {let a=this.type==="!"?"))"+(this.isStart()&&!e&&!t?Ct:"")+Se+")":this.type==="@"?")":this.type==="?"?")?":this.type==="+"&&o?")":this.type==="*"&&o?")?":`)${this.type}`;h=i+r+a;}return [h,W(r),this.#s=!!this.#s,this.#n]}#d(t){return this.#r.map(e=>{if(typeof e=="string")throw new Error("string type in extglob ast??");let[s,i,r,o]=e.toRegExpSource(t);return this.#n=this.#n||o,s}).filter(e=>!(this.isStart()&&this.isEnd())||!!e).join("|")}static#E(t,e,s=false){let i=false,r="",o=false,h=false;for(let a=0;a<t.length;a++){let l=t.charAt(a);if(i){i=false,r+=(As.has(l)?"\\":"")+l;continue}if(l==="*"){if(h)continue;h=true,r+=s&&/^[*]+$/.test(t)?Ee:Se,e=true;continue}else h=false;if(l==="\\"){a===t.length-1?r+="\\\\":i=true;continue}if(l==="["){let[u,c,d,f]=ye(t,a);if(d){r+=u,o=o||c,a+=d-1,e=e||f;continue}}if(l==="?"){r+=Kt,e=true;continue}r+=ks(l);}return [r,W(t),!!e,o]}};var tt=(n,{windowsPathsNoEscape:t=false,magicalBraces:e=false}={})=>e?t?n.replace(/[?*()[\]{}]/g,"[$&]"):n.replace(/[?*()[\]\\{}]/g,"\\$&"):t?n.replace(/[?*()[\]]/g,"[$&]"):n.replace(/[?*()[\]\\]/g,"\\$&");var O=(n,t,e={})=>(at(t),!e.nocomment&&t.charAt(0)==="#"?false:new D(t,e).match(n)),Rs=/^\*+([^+@!?\*\[\(]*)$/,Os=n=>t=>!t.startsWith(".")&&t.endsWith(n),Fs=n=>t=>t.endsWith(n),Ds=n=>(n=n.toLowerCase(),t=>!t.startsWith(".")&&t.toLowerCase().endsWith(n)),Ms=n=>(n=n.toLowerCase(),t=>t.toLowerCase().endsWith(n)),Ns=/^\*+\.\*+$/,_s=n=>!n.startsWith(".")&&n.includes("."),Ls=n=>n!=="."&&n!==".."&&n.includes("."),Ws=/^\.\*+$/,Ps=n=>n!=="."&&n!==".."&&n.startsWith("."),js=/^\*+$/,Is=n=>n.length!==0&&!n.startsWith("."),zs=n=>n.length!==0&&n!=="."&&n!=="..",Bs=/^\?+([^+@!?\*\[\(]*)?$/,Us=([n,t=""])=>{let e=Ce([n]);return t?(t=t.toLowerCase(),s=>e(s)&&s.toLowerCase().endsWith(t)):e},$s=([n,t=""])=>{let e=Te([n]);return t?(t=t.toLowerCase(),s=>e(s)&&s.toLowerCase().endsWith(t)):e},Gs=([n,t=""])=>{let e=Te([n]);return t?s=>e(s)&&s.endsWith(t):e},Hs=([n,t=""])=>{let e=Ce([n]);return t?s=>e(s)&&s.endsWith(t):e},Ce=([n])=>{let t=n.length;return e=>e.length===t&&!e.startsWith(".")},Te=([n])=>{let t=n.length;return e=>e.length===t&&e!=="."&&e!==".."},Ae=typeof process=="object"&&process?typeof process.env=="object"&&process.env&&process.env.__MINIMATCH_TESTING_PLATFORM__||process.platform:"posix",xe={win32:{sep:"\\"},posix:{sep:"/"}},qs=Ae==="win32"?xe.win32.sep:xe.posix.sep;O.sep=qs;var A=Symbol("globstar **");O.GLOBSTAR=A;var Ks="[^/]",Vs=Ks+"*?",Ys="(?:(?!(?:\\/|^)(?:\\.{1,2})($|\\/)).)*?",Xs="(?:(?!(?:\\/|^)\\.).)*?",Js=(n,t={})=>e=>O(e,n,t);O.filter=Js;var N=(n,t={})=>Object.assign({},n,t),Zs=n=>{if(!n||typeof n!="object"||!Object.keys(n).length)return O;let t=O;return Object.assign((s,i,r={})=>t(s,i,N(n,r)),{Minimatch:class extends t.Minimatch{constructor(i,r={}){super(i,N(n,r));}static defaults(i){return t.defaults(N(n,i)).Minimatch}},AST:class extends t.AST{constructor(i,r,o={}){super(i,r,N(n,o));}static fromGlob(i,r={}){return t.AST.fromGlob(i,N(n,r))}},unescape:(s,i={})=>t.unescape(s,N(n,i)),escape:(s,i={})=>t.escape(s,N(n,i)),filter:(s,i={})=>t.filter(s,N(n,i)),defaults:s=>t.defaults(N(n,s)),makeRe:(s,i={})=>t.makeRe(s,N(n,i)),braceExpand:(s,i={})=>t.braceExpand(s,N(n,i)),match:(s,i,r={})=>t.match(s,i,N(n,r)),sep:t.sep,GLOBSTAR:A})};O.defaults=Zs;var ke=(n,t={})=>(at(n),t.nobrace||!/\{(?:(?!\{).)*\}/.test(n)?[n]:ge(n,{max:t.braceExpandMax}));O.braceExpand=ke;var Qs=(n,t={})=>new D(n,t).makeRe();O.makeRe=Qs;var ti=(n,t,e={})=>{let s=new D(t,e);return n=n.filter(i=>s.match(i)),s.options.nonull&&!n.length&&n.push(t),n};O.match=ti;var ve=/[?*]|[+@!]\(.*?\)|\[|\]/,ei=n=>n.replace(/[-[\]{}()*+?.,\\^$|#\s]/g,"\\$&"),D=class{options;set;pattern;windowsPathsNoEscape;nonegate;negate;comment;empty;preserveMultipleSlashes;partial;globSet;globParts;nocase;isWindows;platform;windowsNoMagicRoot;regexp;constructor(t,e={}){at(t),e=e||{},this.options=e,this.pattern=t,this.platform=e.platform||Ae,this.isWindows=this.platform==="win32";let s="allowWindowsEscape";this.windowsPathsNoEscape=!!e.windowsPathsNoEscape||e[s]===false,this.windowsPathsNoEscape&&(this.pattern=this.pattern.replace(/\\/g,"/")),this.preserveMultipleSlashes=!!e.preserveMultipleSlashes,this.regexp=null,this.negate=false,this.nonegate=!!e.nonegate,this.comment=false,this.empty=false,this.partial=!!e.partial,this.nocase=!!this.options.nocase,this.windowsNoMagicRoot=e.windowsNoMagicRoot!==void 0?e.windowsNoMagicRoot:!!(this.isWindows&&this.nocase),this.globSet=[],this.globParts=[],this.set=[],this.make();}hasMagic(){if(this.options.magicalBraces&&this.set.length>1)return  true;for(let t of this.set)for(let e of t)if(typeof e!="string")return  true;return  false}debug(...t){}make(){let t=this.pattern,e=this.options;if(!e.nocomment&&t.charAt(0)==="#"){this.comment=true;return}if(!t){this.empty=true;return}this.parseNegate(),this.globSet=[...new Set(this.braceExpand())],e.debug&&(this.debug=(...r)=>console.error(...r)),this.debug(this.pattern,this.globSet);let s=this.globSet.map(r=>this.slashSplit(r));this.globParts=this.preprocess(s),this.debug(this.pattern,this.globParts);let i=this.globParts.map((r,o,h)=>{if(this.isWindows&&this.windowsNoMagicRoot){let a=r[0]===""&&r[1]===""&&(r[2]==="?"||!ve.test(r[2]))&&!ve.test(r[3]),l=/^[a-z]:/i.test(r[0]);if(a)return [...r.slice(0,4),...r.slice(4).map(u=>this.parse(u))];if(l)return [r[0],...r.slice(1).map(u=>this.parse(u))]}return r.map(a=>this.parse(a))});if(this.debug(this.pattern,i),this.set=i.filter(r=>r.indexOf(false)===-1),this.isWindows)for(let r=0;r<this.set.length;r++){let o=this.set[r];o[0]===""&&o[1]===""&&this.globParts[r][2]==="?"&&typeof o[3]=="string"&&/^[a-z]:$/i.test(o[3])&&(o[2]="?");}this.debug(this.pattern,this.set);}preprocess(t){if(this.options.noglobstar)for(let s=0;s<t.length;s++)for(let i=0;i<t[s].length;i++)t[s][i]==="**"&&(t[s][i]="*");let{optimizationLevel:e=1}=this.options;return e>=2?(t=this.firstPhasePreProcess(t),t=this.secondPhasePreProcess(t)):e>=1?t=this.levelOneOptimize(t):t=this.adjascentGlobstarOptimize(t),t}adjascentGlobstarOptimize(t){return t.map(e=>{let s=-1;for(;(s=e.indexOf("**",s+1))!==-1;){let i=s;for(;e[i+1]==="**";)i++;i!==s&&e.splice(s,i-s);}return e})}levelOneOptimize(t){return t.map(e=>(e=e.reduce((s,i)=>{let r=s[s.length-1];return i==="**"&&r==="**"?s:i===".."&&r&&r!==".."&&r!=="."&&r!=="**"?(s.pop(),s):(s.push(i),s)},[]),e.length===0?[""]:e))}levelTwoFileOptimize(t){Array.isArray(t)||(t=this.slashSplit(t));let e=false;do{if(e=false,!this.preserveMultipleSlashes){for(let i=1;i<t.length-1;i++){let r=t[i];i===1&&r===""&&t[0]===""||(r==="."||r==="")&&(e=true,t.splice(i,1),i--);}t[0]==="."&&t.length===2&&(t[1]==="."||t[1]==="")&&(e=true,t.pop());}let s=0;for(;(s=t.indexOf("..",s+1))!==-1;){let i=t[s-1];i&&i!=="."&&i!==".."&&i!=="**"&&(e=true,t.splice(s-1,2),s-=2);}}while(e);return t.length===0?[""]:t}firstPhasePreProcess(t){let e=false;do{e=false;for(let s of t){let i=-1;for(;(i=s.indexOf("**",i+1))!==-1;){let o=i;for(;s[o+1]==="**";)o++;o>i&&s.splice(i+1,o-i);let h=s[i+1],a=s[i+2],l=s[i+3];if(h!==".."||!a||a==="."||a===".."||!l||l==="."||l==="..")continue;e=true,s.splice(i,1);let u=s.slice(0);u[i]="**",t.push(u),i--;}if(!this.preserveMultipleSlashes){for(let o=1;o<s.length-1;o++){let h=s[o];o===1&&h===""&&s[0]===""||(h==="."||h==="")&&(e=true,s.splice(o,1),o--);}s[0]==="."&&s.length===2&&(s[1]==="."||s[1]==="")&&(e=true,s.pop());}let r=0;for(;(r=s.indexOf("..",r+1))!==-1;){let o=s[r-1];if(o&&o!=="."&&o!==".."&&o!=="**"){e=true;let a=r===1&&s[r+1]==="**"?["."]:[];s.splice(r-1,2,...a),s.length===0&&s.push(""),r-=2;}}}}while(e);return t}secondPhasePreProcess(t){for(let e=0;e<t.length-1;e++)for(let s=e+1;s<t.length;s++){let i=this.partsMatch(t[e],t[s],!this.preserveMultipleSlashes);if(i){t[e]=[],t[s]=i;break}}return t.filter(e=>e.length)}partsMatch(t,e,s=false){let i=0,r=0,o=[],h="";for(;i<t.length&&r<e.length;)if(t[i]===e[r])o.push(h==="b"?e[r]:t[i]),i++,r++;else if(s&&t[i]==="**"&&e[r]===t[i+1])o.push(t[i]),i++;else if(s&&e[r]==="**"&&t[i]===e[r+1])o.push(e[r]),r++;else if(t[i]==="*"&&e[r]&&(this.options.dot||!e[r].startsWith("."))&&e[r]!=="**"){if(h==="b")return  false;h="a",o.push(t[i]),i++,r++;}else if(e[r]==="*"&&t[i]&&(this.options.dot||!t[i].startsWith("."))&&t[i]!=="**"){if(h==="a")return  false;h="b",o.push(e[r]),i++,r++;}else return  false;return t.length===e.length&&o}parseNegate(){if(this.nonegate)return;let t=this.pattern,e=false,s=0;for(let i=0;i<t.length&&t.charAt(i)==="!";i++)e=!e,s++;s&&(this.pattern=t.slice(s)),this.negate=e;}matchOne(t,e,s=false){let i=this.options;if(this.isWindows){let p=typeof t[0]=="string"&&/^[a-z]:$/i.test(t[0]),w=!p&&t[0]===""&&t[1]===""&&t[2]==="?"&&/^[a-z]:$/i.test(t[3]),g=typeof e[0]=="string"&&/^[a-z]:$/i.test(e[0]),S=!g&&e[0]===""&&e[1]===""&&e[2]==="?"&&typeof e[3]=="string"&&/^[a-z]:$/i.test(e[3]),E=w?3:p?0:void 0,y=S?3:g?0:void 0;if(typeof E=="number"&&typeof y=="number"){let[b,z]=[t[E],e[y]];b.toLowerCase()===z.toLowerCase()&&(e[y]=b,y>E?e=e.slice(y):E>y&&(t=t.slice(E)));}}let{optimizationLevel:r=1}=this.options;r>=2&&(t=this.levelTwoFileOptimize(t)),this.debug("matchOne",this,{file:t,pattern:e}),this.debug("matchOne",t.length,e.length);for(var o=0,h=0,a=t.length,l=e.length;o<a&&h<l;o++,h++){this.debug("matchOne loop");var u=e[h],c=t[o];if(this.debug(e,u,c),u===false)return  false;if(u===A){this.debug("GLOBSTAR",[e,u,c]);var d=o,f=h+1;if(f===l){for(this.debug("** at the end");o<a;o++)if(t[o]==="."||t[o]===".."||!i.dot&&t[o].charAt(0)===".")return  false;return  true}for(;d<a;){var m=t[d];if(this.debug(`
-globstar while`,t,d,e,f,m),this.matchOne(t.slice(d),e.slice(f),s))return this.debug("globstar found match!",d,a,m),true;if(m==="."||m===".."||!i.dot&&m.charAt(0)==="."){this.debug("dot detected!",t,d,e,f);break}this.debug("globstar swallow a segment, and continue"),d++;}return !!(s&&(this.debug(`
->>> no match, partial?`,t,d,e,f),d===a))}let p;if(typeof u=="string"?(p=c===u,this.debug("string match",u,c,p)):(p=u.test(c),this.debug("pattern match",u,c,p)),!p)return  false}if(o===a&&h===l)return  true;if(o===a)return s;if(h===l)return o===a-1&&t[o]==="";throw new Error("wtf?")}braceExpand(){return ke(this.pattern,this.options)}parse(t){at(t);let e=this.options;if(t==="**")return A;if(t==="")return "";let s,i=null;(s=t.match(js))?i=e.dot?zs:Is:(s=t.match(Rs))?i=(e.nocase?e.dot?Ms:Ds:e.dot?Fs:Os)(s[1]):(s=t.match(Bs))?i=(e.nocase?e.dot?$s:Us:e.dot?Gs:Hs)(s):(s=t.match(Ns))?i=e.dot?Ls:_s:(s=t.match(Ws))&&(i=Ps);let r=Q.fromGlob(t,this.options).toMMPattern();return i&&typeof r=="object"&&Reflect.defineProperty(r,"test",{value:i}),r}makeRe(){if(this.regexp||this.regexp===false)return this.regexp;let t=this.set;if(!t.length)return this.regexp=false,this.regexp;let e=this.options,s=e.noglobstar?Vs:e.dot?Ys:Xs,i=new Set(e.nocase?["i"]:[]),r=t.map(a=>{let l=a.map(c=>{if(c instanceof RegExp)for(let d of c.flags.split(""))i.add(d);return typeof c=="string"?ei(c):c===A?A:c._src});l.forEach((c,d)=>{let f=l[d+1],m=l[d-1];c!==A||m===A||(m===void 0?f!==void 0&&f!==A?l[d+1]="(?:\\/|"+s+"\\/)?"+f:l[d]=s:f===void 0?l[d-1]=m+"(?:\\/|\\/"+s+")?":f!==A&&(l[d-1]=m+"(?:\\/|\\/"+s+"\\/)"+f,l[d+1]=A));});let u=l.filter(c=>c!==A);if(this.partial&&u.length>=1){let c=[];for(let d=1;d<=u.length;d++)c.push(u.slice(0,d).join("/"));return "(?:"+c.join("|")+")"}return u.join("/")}).join("|"),[o,h]=t.length>1?["(?:",")"]:["",""];r="^"+o+r+h+"$",this.partial&&(r="^(?:\\/|"+o+r.slice(1,-1)+h+")$"),this.negate&&(r="^(?!"+r+").+$");try{this.regexp=new RegExp(r,[...i].join(""));}catch{this.regexp=false;}return this.regexp}slashSplit(t){return this.preserveMultipleSlashes?t.split("/"):this.isWindows&&/^\/\/[^\/]+/.test(t)?["",...t.split(/\/+/)]:t.split(/\/+/)}match(t,e=this.partial){if(this.debug("match",t,this.pattern),this.comment)return  false;if(this.empty)return t==="";if(t==="/"&&e)return  true;let s=this.options;this.isWindows&&(t=t.split("\\").join("/"));let i=this.slashSplit(t);this.debug(this.pattern,"split",i);let r=this.set;this.debug(this.pattern,"set",r);let o=i[i.length-1];if(!o)for(let h=i.length-2;!o&&h>=0;h--)o=i[h];for(let h=0;h<r.length;h++){let a=r[h],l=i;if(s.matchBase&&a.length===1&&(l=[o]),this.matchOne(l,a,e))return s.flipNegate?true:!this.negate}return s.flipNegate?false:this.negate}static defaults(t){return O.defaults(t).Minimatch}};O.AST=Q;O.Minimatch=D;O.escape=tt;O.unescape=W;var si=typeof performance=="object"&&performance&&typeof performance.now=="function"?performance:Date,Oe=new Set,Vt=typeof process=="object"&&process?process:{},Fe=(n,t,e,s)=>{typeof Vt.emitWarning=="function"?Vt.emitWarning(n,t,e,s):console.error(`[${e}] ${t}: ${n}`);},At=globalThis.AbortController,Re=globalThis.AbortSignal;if(typeof At>"u"){Re=class{onabort;_onabort=[];reason;aborted=false;addEventListener(e,s){this._onabort.push(s);}},At=class{constructor(){t();}signal=new Re;abort(e){if(!this.signal.aborted){this.signal.reason=e,this.signal.aborted=true;for(let s of this.signal._onabort)s(e);this.signal.onabort?.(e);}}};let n=Vt.env?.LRU_CACHE_IGNORE_AC_WARNING!=="1",t=()=>{n&&(n=false,Fe("AbortController is not defined. If using lru-cache in node 14, load an AbortController polyfill from the `node-abort-controller` package. A minimal polyfill is provided for use by LRUCache.fetch(), but it should not be relied upon in other contexts (eg, passing it to other APIs that use AbortController/AbortSignal might have undesirable effects). You may disable this with LRU_CACHE_IGNORE_AC_WARNING=1 in the env.","NO_ABORT_CONTROLLER","ENOTSUP",t));};}var ii=n=>!Oe.has(n);var q=n=>n&&n===Math.floor(n)&&n>0&&isFinite(n),De=n=>q(n)?n<=Math.pow(2,8)?Uint8Array:n<=Math.pow(2,16)?Uint16Array:n<=Math.pow(2,32)?Uint32Array:n<=Number.MAX_SAFE_INTEGER?Tt:null:null,Tt=class extends Array{constructor(n){super(n),this.fill(0);}},ri=class ct{heap;length;static#t=false;static create(t){let e=De(t);if(!e)return [];ct.#t=true;let s=new ct(t,e);return ct.#t=false,s}constructor(t,e){if(!ct.#t)throw new TypeError("instantiate Stack using Stack.create(n)");this.heap=new e(t),this.length=0;}push(t){this.heap[this.length++]=t;}pop(){return this.heap[--this.length]}},ft=class Me{#t;#s;#n;#r;#o;#S;#w;#c;get perf(){return this.#c}ttl;ttlResolution;ttlAutopurge;updateAgeOnGet;updateAgeOnHas;allowStale;noDisposeOnSet;noUpdateTTL;maxEntrySize;sizeCalculation;noDeleteOnFetchRejection;noDeleteOnStaleGet;allowStaleOnFetchAbort;allowStaleOnFetchRejection;ignoreFetchAbort;#h;#u;#f;#a;#i;#d;#E;#b;#p;#R;#m;#C;#T;#g;#y;#x;#A;#e;#_;static unsafeExposeInternals(t){return {starts:t.#T,ttls:t.#g,autopurgeTimers:t.#y,sizes:t.#C,keyMap:t.#f,keyList:t.#a,valList:t.#i,next:t.#d,prev:t.#E,get head(){return t.#b},get tail(){return t.#p},free:t.#R,isBackgroundFetch:e=>t.#l(e),backgroundFetch:(e,s,i,r)=>t.#U(e,s,i,r),moveToTail:e=>t.#W(e),indexes:e=>t.#F(e),rindexes:e=>t.#D(e),isStale:e=>t.#v(e)}}get max(){return this.#t}get maxSize(){return this.#s}get calculatedSize(){return this.#u}get size(){return this.#h}get fetchMethod(){return this.#S}get memoMethod(){return this.#w}get dispose(){return this.#n}get onInsert(){return this.#r}get disposeAfter(){return this.#o}constructor(t){let{max:e=0,ttl:s,ttlResolution:i=1,ttlAutopurge:r,updateAgeOnGet:o,updateAgeOnHas:h,allowStale:a,dispose:l,onInsert:u,disposeAfter:c,noDisposeOnSet:d,noUpdateTTL:f,maxSize:m=0,maxEntrySize:p=0,sizeCalculation:w,fetchMethod:g,memoMethod:S,noDeleteOnFetchRejection:E,noDeleteOnStaleGet:y,allowStaleOnFetchRejection:b,allowStaleOnFetchAbort:z,ignoreFetchAbort:$,perf:J}=t;if(J!==void 0&&typeof J?.now!="function")throw new TypeError("perf option must have a now() method if specified");if(this.#c=J??si,e!==0&&!q(e))throw new TypeError("max option must be a nonnegative integer");let Z=e?De(e):Array;if(!Z)throw new Error("invalid max value: "+e);if(this.#t=e,this.#s=m,this.maxEntrySize=p||this.#s,this.sizeCalculation=w,this.sizeCalculation){if(!this.#s&&!this.maxEntrySize)throw new TypeError("cannot set sizeCalculation without setting maxSize or maxEntrySize");if(typeof this.sizeCalculation!="function")throw new TypeError("sizeCalculation set to non-function")}if(S!==void 0&&typeof S!="function")throw new TypeError("memoMethod must be a function if defined");if(this.#w=S,g!==void 0&&typeof g!="function")throw new TypeError("fetchMethod must be a function if specified");if(this.#S=g,this.#A=!!g,this.#f=new Map,this.#a=new Array(e).fill(void 0),this.#i=new Array(e).fill(void 0),this.#d=new Z(e),this.#E=new Z(e),this.#b=0,this.#p=0,this.#R=ri.create(e),this.#h=0,this.#u=0,typeof l=="function"&&(this.#n=l),typeof u=="function"&&(this.#r=u),typeof c=="function"?(this.#o=c,this.#m=[]):(this.#o=void 0,this.#m=void 0),this.#x=!!this.#n,this.#_=!!this.#r,this.#e=!!this.#o,this.noDisposeOnSet=!!d,this.noUpdateTTL=!!f,this.noDeleteOnFetchRejection=!!E,this.allowStaleOnFetchRejection=!!b,this.allowStaleOnFetchAbort=!!z,this.ignoreFetchAbort=!!$,this.maxEntrySize!==0){if(this.#s!==0&&!q(this.#s))throw new TypeError("maxSize must be a positive integer if specified");if(!q(this.maxEntrySize))throw new TypeError("maxEntrySize must be a positive integer if specified");this.#G();}if(this.allowStale=!!a,this.noDeleteOnStaleGet=!!y,this.updateAgeOnGet=!!o,this.updateAgeOnHas=!!h,this.ttlResolution=q(i)||i===0?i:1,this.ttlAutopurge=!!r,this.ttl=s||0,this.ttl){if(!q(this.ttl))throw new TypeError("ttl must be a positive integer if specified");this.#M();}if(this.#t===0&&this.ttl===0&&this.#s===0)throw new TypeError("At least one of max, maxSize, or ttl is required");if(!this.ttlAutopurge&&!this.#t&&!this.#s){let $t="LRU_CACHE_UNBOUNDED";ii($t)&&(Oe.add($t),Fe("TTL caching without ttlAutopurge, max, or maxSize can result in unbounded memory consumption.","UnboundedCacheWarning",$t,Me));}}getRemainingTTL(t){return this.#f.has(t)?1/0:0}#M(){let t=new Tt(this.#t),e=new Tt(this.#t);this.#g=t,this.#T=e;let s=this.ttlAutopurge?new Array(this.#t):void 0;this.#y=s,this.#j=(o,h,a=this.#c.now())=>{if(e[o]=h!==0?a:0,t[o]=h,s?.[o]&&(clearTimeout(s[o]),s[o]=void 0),h!==0&&s){let l=setTimeout(()=>{this.#v(o)&&this.#O(this.#a[o],"expire");},h+1);l.unref&&l.unref(),s[o]=l;}},this.#k=o=>{e[o]=t[o]!==0?this.#c.now():0;},this.#N=(o,h)=>{if(t[h]){let a=t[h],l=e[h];if(!a||!l)return;o.ttl=a,o.start=l,o.now=i||r();let u=o.now-l;o.remainingTTL=a-u;}};let i=0,r=()=>{let o=this.#c.now();if(this.ttlResolution>0){i=o;let h=setTimeout(()=>i=0,this.ttlResolution);h.unref&&h.unref();}return o};this.getRemainingTTL=o=>{let h=this.#f.get(o);if(h===void 0)return 0;let a=t[h],l=e[h];if(!a||!l)return 1/0;let u=(i||r())-l;return a-u},this.#v=o=>{let h=e[o],a=t[o];return !!a&&!!h&&(i||r())-h>a};}#k=()=>{};#N=()=>{};#j=()=>{};#v=()=>false;#G(){let t=new Tt(this.#t);this.#u=0,this.#C=t,this.#P=e=>{this.#u-=t[e],t[e]=0;},this.#I=(e,s,i,r)=>{if(this.#l(s))return 0;if(!q(i))if(r){if(typeof r!="function")throw new TypeError("sizeCalculation must be a function");if(i=r(s,e),!q(i))throw new TypeError("sizeCalculation return invalid (expect positive integer)")}else throw new TypeError("invalid size value (must be positive integer). When maxSize or maxEntrySize is used, sizeCalculation or size must be set.");return i},this.#L=(e,s,i)=>{if(t[e]=s,this.#s){let r=this.#s-t[e];for(;this.#u>r;)this.#B(true);}this.#u+=t[e],i&&(i.entrySize=s,i.totalCalculatedSize=this.#u);};}#P=t=>{};#L=(t,e,s)=>{};#I=(t,e,s,i)=>{if(s||i)throw new TypeError("cannot set size without setting maxSize or maxEntrySize on cache");return 0};*#F({allowStale:t=this.allowStale}={}){if(this.#h)for(let e=this.#p;!(!this.#z(e)||((t||!this.#v(e))&&(yield e),e===this.#b));)e=this.#E[e];}*#D({allowStale:t=this.allowStale}={}){if(this.#h)for(let e=this.#b;!(!this.#z(e)||((t||!this.#v(e))&&(yield e),e===this.#p));)e=this.#d[e];}#z(t){return t!==void 0&&this.#f.get(this.#a[t])===t}*entries(){for(let t of this.#F())this.#i[t]!==void 0&&this.#a[t]!==void 0&&!this.#l(this.#i[t])&&(yield [this.#a[t],this.#i[t]]);}*rentries(){for(let t of this.#D())this.#i[t]!==void 0&&this.#a[t]!==void 0&&!this.#l(this.#i[t])&&(yield [this.#a[t],this.#i[t]]);}*keys(){for(let t of this.#F()){let e=this.#a[t];e!==void 0&&!this.#l(this.#i[t])&&(yield e);}}*rkeys(){for(let t of this.#D()){let e=this.#a[t];e!==void 0&&!this.#l(this.#i[t])&&(yield e);}}*values(){for(let t of this.#F())this.#i[t]!==void 0&&!this.#l(this.#i[t])&&(yield this.#i[t]);}*rvalues(){for(let t of this.#D())this.#i[t]!==void 0&&!this.#l(this.#i[t])&&(yield this.#i[t]);}[Symbol.iterator](){return this.entries()}[Symbol.toStringTag]="LRUCache";find(t,e={}){for(let s of this.#F()){let i=this.#i[s],r=this.#l(i)?i.__staleWhileFetching:i;if(r!==void 0&&t(r,this.#a[s],this))return this.get(this.#a[s],e)}}forEach(t,e=this){for(let s of this.#F()){let i=this.#i[s],r=this.#l(i)?i.__staleWhileFetching:i;r!==void 0&&t.call(e,r,this.#a[s],this);}}rforEach(t,e=this){for(let s of this.#D()){let i=this.#i[s],r=this.#l(i)?i.__staleWhileFetching:i;r!==void 0&&t.call(e,r,this.#a[s],this);}}purgeStale(){let t=false;for(let e of this.#D({allowStale:true}))this.#v(e)&&(this.#O(this.#a[e],"expire"),t=true);return t}info(t){let e=this.#f.get(t);if(e===void 0)return;let s=this.#i[e],i=this.#l(s)?s.__staleWhileFetching:s;if(i===void 0)return;let r={value:i};if(this.#g&&this.#T){let o=this.#g[e],h=this.#T[e];if(o&&h){let a=o-(this.#c.now()-h);r.ttl=a,r.start=Date.now();}}return this.#C&&(r.size=this.#C[e]),r}dump(){let t=[];for(let e of this.#F({allowStale:true})){let s=this.#a[e],i=this.#i[e],r=this.#l(i)?i.__staleWhileFetching:i;if(r===void 0||s===void 0)continue;let o={value:r};if(this.#g&&this.#T){o.ttl=this.#g[e];let h=this.#c.now()-this.#T[e];o.start=Math.floor(Date.now()-h);}this.#C&&(o.size=this.#C[e]),t.unshift([s,o]);}return t}load(t){this.clear();for(let[e,s]of t){if(s.start){let i=Date.now()-s.start;s.start=this.#c.now()-i;}this.set(e,s.value,s);}}set(t,e,s={}){if(e===void 0)return this.delete(t),this;let{ttl:i=this.ttl,start:r,noDisposeOnSet:o=this.noDisposeOnSet,sizeCalculation:h=this.sizeCalculation,status:a}=s,{noUpdateTTL:l=this.noUpdateTTL}=s,u=this.#I(t,e,s.size||0,h);if(this.maxEntrySize&&u>this.maxEntrySize)return a&&(a.set="miss",a.maxEntrySizeExceeded=true),this.#O(t,"set"),this;let c=this.#h===0?void 0:this.#f.get(t);if(c===void 0)c=this.#h===0?this.#p:this.#R.length!==0?this.#R.pop():this.#h===this.#t?this.#B(false):this.#h,this.#a[c]=t,this.#i[c]=e,this.#f.set(t,c),this.#d[this.#p]=c,this.#E[c]=this.#p,this.#p=c,this.#h++,this.#L(c,u,a),a&&(a.set="add"),l=false,this.#_&&this.#r?.(e,t,"add");else {this.#W(c);let d=this.#i[c];if(e!==d){if(this.#A&&this.#l(d)){d.__abortController.abort(new Error("replaced"));let{__staleWhileFetching:f}=d;f!==void 0&&!o&&(this.#x&&this.#n?.(f,t,"set"),this.#e&&this.#m?.push([f,t,"set"]));}else o||(this.#x&&this.#n?.(d,t,"set"),this.#e&&this.#m?.push([d,t,"set"]));if(this.#P(c),this.#L(c,u,a),this.#i[c]=e,a){a.set="replace";let f=d&&this.#l(d)?d.__staleWhileFetching:d;f!==void 0&&(a.oldValue=f);}}else a&&(a.set="update");this.#_&&this.onInsert?.(e,t,e===d?"update":"replace");}if(i!==0&&!this.#g&&this.#M(),this.#g&&(l||this.#j(c,i,r),a&&this.#N(a,c)),!o&&this.#e&&this.#m){let d=this.#m,f;for(;f=d?.shift();)this.#o?.(...f);}return this}pop(){try{for(;this.#h;){let t=this.#i[this.#b];if(this.#B(!0),this.#l(t)){if(t.__staleWhileFetching)return t.__staleWhileFetching}else if(t!==void 0)return t}}finally{if(this.#e&&this.#m){let t=this.#m,e;for(;e=t?.shift();)this.#o?.(...e);}}}#B(t){let e=this.#b,s=this.#a[e],i=this.#i[e];return this.#A&&this.#l(i)?i.__abortController.abort(new Error("evicted")):(this.#x||this.#e)&&(this.#x&&this.#n?.(i,s,"evict"),this.#e&&this.#m?.push([i,s,"evict"])),this.#P(e),this.#y?.[e]&&(clearTimeout(this.#y[e]),this.#y[e]=void 0),t&&(this.#a[e]=void 0,this.#i[e]=void 0,this.#R.push(e)),this.#h===1?(this.#b=this.#p=0,this.#R.length=0):this.#b=this.#d[e],this.#f.delete(s),this.#h--,e}has(t,e={}){let{updateAgeOnHas:s=this.updateAgeOnHas,status:i}=e,r=this.#f.get(t);if(r!==void 0){let o=this.#i[r];if(this.#l(o)&&o.__staleWhileFetching===void 0)return  false;if(this.#v(r))i&&(i.has="stale",this.#N(i,r));else return s&&this.#k(r),i&&(i.has="hit",this.#N(i,r)),true}else i&&(i.has="miss");return  false}peek(t,e={}){let{allowStale:s=this.allowStale}=e,i=this.#f.get(t);if(i===void 0||!s&&this.#v(i))return;let r=this.#i[i];return this.#l(r)?r.__staleWhileFetching:r}#U(t,e,s,i){let r=e===void 0?void 0:this.#i[e];if(this.#l(r))return r;let o=new At,{signal:h}=s;h?.addEventListener("abort",()=>o.abort(h.reason),{signal:o.signal});let a={signal:o.signal,options:s,context:i},l=(p,w=false)=>{let{aborted:g}=o.signal,S=s.ignoreFetchAbort&&p!==void 0,E=s.ignoreFetchAbort||!!(s.allowStaleOnFetchAbort&&p!==void 0);if(s.status&&(g&&!w?(s.status.fetchAborted=true,s.status.fetchError=o.signal.reason,S&&(s.status.fetchAbortIgnored=true)):s.status.fetchResolved=true),g&&!S&&!w)return c(o.signal.reason,E);let y=f,b=this.#i[e];return (b===f||S&&w&&b===void 0)&&(p===void 0?y.__staleWhileFetching!==void 0?this.#i[e]=y.__staleWhileFetching:this.#O(t,"fetch"):(s.status&&(s.status.fetchUpdated=true),this.set(t,p,a.options))),p},u=p=>(s.status&&(s.status.fetchRejected=true,s.status.fetchError=p),c(p,false)),c=(p,w)=>{let{aborted:g}=o.signal,S=g&&s.allowStaleOnFetchAbort,E=S||s.allowStaleOnFetchRejection,y=E||s.noDeleteOnFetchRejection,b=f;if(this.#i[e]===f&&(!y||!w&&b.__staleWhileFetching===void 0?this.#O(t,"fetch"):S||(this.#i[e]=b.__staleWhileFetching)),E)return s.status&&b.__staleWhileFetching!==void 0&&(s.status.returnedStale=true),b.__staleWhileFetching;if(b.__returned===b)throw p},d=(p,w)=>{let g=this.#S?.(t,r,a);g&&g instanceof Promise&&g.then(S=>p(S===void 0?void 0:S),w),o.signal.addEventListener("abort",()=>{(!s.ignoreFetchAbort||s.allowStaleOnFetchAbort)&&(p(void 0),s.allowStaleOnFetchAbort&&(p=S=>l(S,true)));});};s.status&&(s.status.fetchDispatched=true);let f=new Promise(d).then(l,u),m=Object.assign(f,{__abortController:o,__staleWhileFetching:r,__returned:void 0});return e===void 0?(this.set(t,m,{...a.options,status:void 0}),e=this.#f.get(t)):this.#i[e]=m,m}#l(t){if(!this.#A)return  false;let e=t;return !!e&&e instanceof Promise&&e.hasOwnProperty("__staleWhileFetching")&&e.__abortController instanceof At}async fetch(t,e={}){let{allowStale:s=this.allowStale,updateAgeOnGet:i=this.updateAgeOnGet,noDeleteOnStaleGet:r=this.noDeleteOnStaleGet,ttl:o=this.ttl,noDisposeOnSet:h=this.noDisposeOnSet,size:a=0,sizeCalculation:l=this.sizeCalculation,noUpdateTTL:u=this.noUpdateTTL,noDeleteOnFetchRejection:c=this.noDeleteOnFetchRejection,allowStaleOnFetchRejection:d=this.allowStaleOnFetchRejection,ignoreFetchAbort:f=this.ignoreFetchAbort,allowStaleOnFetchAbort:m=this.allowStaleOnFetchAbort,context:p,forceRefresh:w=false,status:g,signal:S}=e;if(!this.#A)return g&&(g.fetch="get"),this.get(t,{allowStale:s,updateAgeOnGet:i,noDeleteOnStaleGet:r,status:g});let E={allowStale:s,updateAgeOnGet:i,noDeleteOnStaleGet:r,ttl:o,noDisposeOnSet:h,size:a,sizeCalculation:l,noUpdateTTL:u,noDeleteOnFetchRejection:c,allowStaleOnFetchRejection:d,allowStaleOnFetchAbort:m,ignoreFetchAbort:f,status:g,signal:S},y=this.#f.get(t);if(y===void 0){g&&(g.fetch="miss");let b=this.#U(t,y,E,p);return b.__returned=b}else {let b=this.#i[y];if(this.#l(b)){let Z=s&&b.__staleWhileFetching!==void 0;return g&&(g.fetch="inflight",Z&&(g.returnedStale=true)),Z?b.__staleWhileFetching:b.__returned=b}let z=this.#v(y);if(!w&&!z)return g&&(g.fetch="hit"),this.#W(y),i&&this.#k(y),g&&this.#N(g,y),b;let $=this.#U(t,y,E,p),J=$.__staleWhileFetching!==void 0&&s;return g&&(g.fetch=z?"stale":"refresh",J&&z&&(g.returnedStale=true)),J?$.__staleWhileFetching:$.__returned=$}}async forceFetch(t,e={}){let s=await this.fetch(t,e);if(s===void 0)throw new Error("fetch() returned undefined");return s}memo(t,e={}){let s=this.#w;if(!s)throw new Error("no memoMethod provided to constructor");let{context:i,forceRefresh:r,...o}=e,h=this.get(t,o);if(!r&&h!==void 0)return h;let a=s(t,h,{options:o,context:i});return this.set(t,a,o),a}get(t,e={}){let{allowStale:s=this.allowStale,updateAgeOnGet:i=this.updateAgeOnGet,noDeleteOnStaleGet:r=this.noDeleteOnStaleGet,status:o}=e,h=this.#f.get(t);if(h!==void 0){let a=this.#i[h],l=this.#l(a);return o&&this.#N(o,h),this.#v(h)?(o&&(o.get="stale"),l?(o&&s&&a.__staleWhileFetching!==void 0&&(o.returnedStale=true),s?a.__staleWhileFetching:void 0):(r||this.#O(t,"expire"),o&&s&&(o.returnedStale=true),s?a:void 0)):(o&&(o.get="hit"),l?a.__staleWhileFetching:(this.#W(h),i&&this.#k(h),a))}else o&&(o.get="miss");}#$(t,e){this.#E[e]=t,this.#d[t]=e;}#W(t){t!==this.#p&&(t===this.#b?this.#b=this.#d[t]:this.#$(this.#E[t],this.#d[t]),this.#$(this.#p,t),this.#p=t);}delete(t){return this.#O(t,"delete")}#O(t,e){let s=false;if(this.#h!==0){let i=this.#f.get(t);if(i!==void 0)if(this.#y?.[i]&&(clearTimeout(this.#y?.[i]),this.#y[i]=void 0),s=true,this.#h===1)this.#H(e);else {this.#P(i);let r=this.#i[i];if(this.#l(r)?r.__abortController.abort(new Error("deleted")):(this.#x||this.#e)&&(this.#x&&this.#n?.(r,t,e),this.#e&&this.#m?.push([r,t,e])),this.#f.delete(t),this.#a[i]=void 0,this.#i[i]=void 0,i===this.#p)this.#p=this.#E[i];else if(i===this.#b)this.#b=this.#d[i];else {let o=this.#E[i];this.#d[o]=this.#d[i];let h=this.#d[i];this.#E[h]=this.#E[i];}this.#h--,this.#R.push(i);}}if(this.#e&&this.#m?.length){let i=this.#m,r;for(;r=i?.shift();)this.#o?.(...r);}return s}clear(){return this.#H("delete")}#H(t){for(let e of this.#D({allowStale:true})){let s=this.#i[e];if(this.#l(s))s.__abortController.abort(new Error("deleted"));else {let i=this.#a[e];this.#x&&this.#n?.(s,i,t),this.#e&&this.#m?.push([s,i,t]);}}if(this.#f.clear(),this.#i.fill(void 0),this.#a.fill(void 0),this.#g&&this.#T){this.#g.fill(0),this.#T.fill(0);for(let e of this.#y??[])e!==void 0&&clearTimeout(e);this.#y?.fill(void 0);}if(this.#C&&this.#C.fill(0),this.#b=0,this.#p=0,this.#R.length=0,this.#u=0,this.#h=0,this.#e&&this.#m){let e=this.#m,s;for(;s=e?.shift();)this.#o?.(...s);}}};var Ne=typeof process=="object"&&process?process:{stdout:null,stderr:null},oi=n=>!!n&&typeof n=="object"&&(n instanceof V||n instanceof require$$0$3||hi(n)||ai(n)),hi=n=>!!n&&typeof n=="object"&&n instanceof EventEmitter&&typeof n.pipe=="function"&&n.pipe!==require$$0$3.Writable.prototype.pipe,ai=n=>!!n&&typeof n=="object"&&n instanceof EventEmitter&&typeof n.write=="function"&&typeof n.end=="function",G$1=Symbol("EOF"),H=Symbol("maybeEmitEnd"),K=Symbol("emittedEnd"),kt=Symbol("emittingEnd"),ut=Symbol("emittedError"),Rt=Symbol("closed"),_e=Symbol("read"),Ot=Symbol("flush"),Le=Symbol("flushChunk"),P=Symbol("encoding"),et=Symbol("decoder"),v=Symbol("flowing"),dt=Symbol("paused"),st=Symbol("resume"),C=Symbol("buffer"),F=Symbol("pipes"),T=Symbol("bufferLength"),Yt=Symbol("bufferPush"),Ft=Symbol("bufferShift"),k=Symbol("objectMode"),x=Symbol("destroyed"),Xt=Symbol("error"),Jt=Symbol("emitData"),We=Symbol("emitEnd"),Zt=Symbol("emitEnd2"),B=Symbol("async"),Qt=Symbol("abort"),Dt=Symbol("aborted"),pt=Symbol("signal"),Y=Symbol("dataListeners"),M=Symbol("discarded"),mt=n=>Promise.resolve().then(n),li=n=>n(),ci=n=>n==="end"||n==="finish"||n==="prefinish",fi=n=>n instanceof ArrayBuffer||!!n&&typeof n=="object"&&n.constructor&&n.constructor.name==="ArrayBuffer"&&n.byteLength>=0,ui=n=>!Buffer.isBuffer(n)&&ArrayBuffer.isView(n),Mt=class{src;dest;opts;ondrain;constructor(t,e,s){this.src=t,this.dest=e,this.opts=s,this.ondrain=()=>t[st](),this.dest.on("drain",this.ondrain);}unpipe(){this.dest.removeListener("drain",this.ondrain);}proxyErrors(t){}end(){this.unpipe(),this.opts.end&&this.dest.end();}},te=class extends Mt{unpipe(){this.src.removeListener("error",this.proxyErrors),super.unpipe();}constructor(t,e,s){super(t,e,s),this.proxyErrors=i=>this.dest.emit("error",i),t.on("error",this.proxyErrors);}},di=n=>!!n.objectMode,pi=n=>!n.objectMode&&!!n.encoding&&n.encoding!=="buffer",V=class extends EventEmitter{[v]=false;[dt]=false;[F]=[];[C]=[];[k];[P];[B];[et];[G$1]=false;[K]=false;[kt]=false;[Rt]=false;[ut]=null;[T]=0;[x]=false;[pt];[Dt]=false;[Y]=0;[M]=false;writable=true;readable=true;constructor(...t){let e=t[0]||{};if(super(),e.objectMode&&typeof e.encoding=="string")throw new TypeError("Encoding and objectMode may not be used together");di(e)?(this[k]=true,this[P]=null):pi(e)?(this[P]=e.encoding,this[k]=false):(this[k]=false,this[P]=null),this[B]=!!e.async,this[et]=this[P]?new StringDecoder(this[P]):null,e&&e.debugExposeBuffer===true&&Object.defineProperty(this,"buffer",{get:()=>this[C]}),e&&e.debugExposePipes===true&&Object.defineProperty(this,"pipes",{get:()=>this[F]});let{signal:s}=e;s&&(this[pt]=s,s.aborted?this[Qt]():s.addEventListener("abort",()=>this[Qt]()));}get bufferLength(){return this[T]}get encoding(){return this[P]}set encoding(t){throw new Error("Encoding must be set at instantiation time")}setEncoding(t){throw new Error("Encoding must be set at instantiation time")}get objectMode(){return this[k]}set objectMode(t){throw new Error("objectMode must be set at instantiation time")}get async(){return this[B]}set async(t){this[B]=this[B]||!!t;}[Qt](){this[Dt]=true,this.emit("abort",this[pt]?.reason),this.destroy(this[pt]?.reason);}get aborted(){return this[Dt]}set aborted(t){}write(t,e,s){if(this[Dt])return  false;if(this[G$1])throw new Error("write after end");if(this[x])return this.emit("error",Object.assign(new Error("Cannot call write after a stream was destroyed"),{code:"ERR_STREAM_DESTROYED"})),true;typeof e=="function"&&(s=e,e="utf8"),e||(e="utf8");let i=this[B]?mt:li;if(!this[k]&&!Buffer.isBuffer(t)){if(ui(t))t=Buffer.from(t.buffer,t.byteOffset,t.byteLength);else if(fi(t))t=Buffer.from(t);else if(typeof t!="string")throw new Error("Non-contiguous data written to non-objectMode stream")}return this[k]?(this[v]&&this[T]!==0&&this[Ot](true),this[v]?this.emit("data",t):this[Yt](t),this[T]!==0&&this.emit("readable"),s&&i(s),this[v]):t.length?(typeof t=="string"&&!(e===this[P]&&!this[et]?.lastNeed)&&(t=Buffer.from(t,e)),Buffer.isBuffer(t)&&this[P]&&(t=this[et].write(t)),this[v]&&this[T]!==0&&this[Ot](true),this[v]?this.emit("data",t):this[Yt](t),this[T]!==0&&this.emit("readable"),s&&i(s),this[v]):(this[T]!==0&&this.emit("readable"),s&&i(s),this[v])}read(t){if(this[x])return null;if(this[M]=false,this[T]===0||t===0||t&&t>this[T])return this[H](),null;this[k]&&(t=null),this[C].length>1&&!this[k]&&(this[C]=[this[P]?this[C].join(""):Buffer.concat(this[C],this[T])]);let e=this[_e](t||null,this[C][0]);return this[H](),e}[_e](t,e){if(this[k])this[Ft]();else {let s=e;t===s.length||t===null?this[Ft]():typeof s=="string"?(this[C][0]=s.slice(t),e=s.slice(0,t),this[T]-=t):(this[C][0]=s.subarray(t),e=s.subarray(0,t),this[T]-=t);}return this.emit("data",e),!this[C].length&&!this[G$1]&&this.emit("drain"),e}end(t,e,s){return typeof t=="function"&&(s=t,t=void 0),typeof e=="function"&&(s=e,e="utf8"),t!==void 0&&this.write(t,e),s&&this.once("end",s),this[G$1]=true,this.writable=false,(this[v]||!this[dt])&&this[H](),this}[st](){this[x]||(!this[Y]&&!this[F].length&&(this[M]=true),this[dt]=false,this[v]=true,this.emit("resume"),this[C].length?this[Ot]():this[G$1]?this[H]():this.emit("drain"));}resume(){return this[st]()}pause(){this[v]=false,this[dt]=true,this[M]=false;}get destroyed(){return this[x]}get flowing(){return this[v]}get paused(){return this[dt]}[Yt](t){this[k]?this[T]+=1:this[T]+=t.length,this[C].push(t);}[Ft](){return this[k]?this[T]-=1:this[T]-=this[C][0].length,this[C].shift()}[Ot](t=false){do;while(this[Le](this[Ft]())&&this[C].length);!t&&!this[C].length&&!this[G$1]&&this.emit("drain");}[Le](t){return this.emit("data",t),this[v]}pipe(t,e){if(this[x])return t;this[M]=false;let s=this[K];return e=e||{},t===Ne.stdout||t===Ne.stderr?e.end=false:e.end=e.end!==false,e.proxyErrors=!!e.proxyErrors,s?e.end&&t.end():(this[F].push(e.proxyErrors?new te(this,t,e):new Mt(this,t,e)),this[B]?mt(()=>this[st]()):this[st]()),t}unpipe(t){let e=this[F].find(s=>s.dest===t);e&&(this[F].length===1?(this[v]&&this[Y]===0&&(this[v]=false),this[F]=[]):this[F].splice(this[F].indexOf(e),1),e.unpipe());}addListener(t,e){return this.on(t,e)}on(t,e){let s=super.on(t,e);if(t==="data")this[M]=false,this[Y]++,!this[F].length&&!this[v]&&this[st]();else if(t==="readable"&&this[T]!==0)super.emit("readable");else if(ci(t)&&this[K])super.emit(t),this.removeAllListeners(t);else if(t==="error"&&this[ut]){let i=e;this[B]?mt(()=>i.call(this,this[ut])):i.call(this,this[ut]);}return s}removeListener(t,e){return this.off(t,e)}off(t,e){let s=super.off(t,e);return t==="data"&&(this[Y]=this.listeners("data").length,this[Y]===0&&!this[M]&&!this[F].length&&(this[v]=false)),s}removeAllListeners(t){let e=super.removeAllListeners(t);return (t==="data"||t===void 0)&&(this[Y]=0,!this[M]&&!this[F].length&&(this[v]=false)),e}get emittedEnd(){return this[K]}[H](){!this[kt]&&!this[K]&&!this[x]&&this[C].length===0&&this[G$1]&&(this[kt]=true,this.emit("end"),this.emit("prefinish"),this.emit("finish"),this[Rt]&&this.emit("close"),this[kt]=false);}emit(t,...e){let s=e[0];if(t!=="error"&&t!=="close"&&t!==x&&this[x])return  false;if(t==="data")return !this[k]&&!s?false:this[B]?(mt(()=>this[Jt](s)),true):this[Jt](s);if(t==="end")return this[We]();if(t==="close"){if(this[Rt]=true,!this[K]&&!this[x])return  false;let r=super.emit("close");return this.removeAllListeners("close"),r}else if(t==="error"){this[ut]=s,super.emit(Xt,s);let r=!this[pt]||this.listeners("error").length?super.emit("error",s):false;return this[H](),r}else if(t==="resume"){let r=super.emit("resume");return this[H](),r}else if(t==="finish"||t==="prefinish"){let r=super.emit(t);return this.removeAllListeners(t),r}let i=super.emit(t,...e);return this[H](),i}[Jt](t){for(let s of this[F])s.dest.write(t)===false&&this.pause();let e=this[M]?false:super.emit("data",t);return this[H](),e}[We](){return this[K]?false:(this[K]=true,this.readable=false,this[B]?(mt(()=>this[Zt]()),true):this[Zt]())}[Zt](){if(this[et]){let e=this[et].end();if(e){for(let s of this[F])s.dest.write(e);this[M]||super.emit("data",e);}}for(let e of this[F])e.end();let t=super.emit("end");return this.removeAllListeners("end"),t}async collect(){let t=Object.assign([],{dataLength:0});this[k]||(t.dataLength=0);let e=this.promise();return this.on("data",s=>{t.push(s),this[k]||(t.dataLength+=s.length);}),await e,t}async concat(){if(this[k])throw new Error("cannot concat in objectMode");let t=await this.collect();return this[P]?t.join(""):Buffer.concat(t,t.dataLength)}async promise(){return new Promise((t,e)=>{this.on(x,()=>e(new Error("stream destroyed"))),this.on("error",s=>e(s)),this.on("end",()=>t());})}[Symbol.asyncIterator](){this[M]=false;let t=false,e=async()=>(this.pause(),t=true,{value:void 0,done:true});return {next:()=>{if(t)return e();let i=this.read();if(i!==null)return Promise.resolve({done:false,value:i});if(this[G$1])return e();let r,o,h=c=>{this.off("data",a),this.off("end",l),this.off(x,u),e(),o(c);},a=c=>{this.off("error",h),this.off("end",l),this.off(x,u),this.pause(),r({value:c,done:!!this[G$1]});},l=()=>{this.off("error",h),this.off("data",a),this.off(x,u),e(),r({done:true,value:void 0});},u=()=>h(new Error("stream destroyed"));return new Promise((c,d)=>{o=d,r=c,this.once(x,u),this.once("error",h),this.once("end",l),this.once("data",a);})},throw:e,return:e,[Symbol.asyncIterator](){return this},[Symbol.asyncDispose]:async()=>{}}}[Symbol.iterator](){this[M]=false;let t=false,e=()=>(this.pause(),this.off(Xt,e),this.off(x,e),this.off("end",e),t=true,{done:true,value:void 0}),s=()=>{if(t)return e();let i=this.read();return i===null?e():{done:false,value:i}};return this.once("end",e),this.once(Xt,e),this.once(x,e),{next:s,throw:e,return:e,[Symbol.iterator](){return this},[Symbol.dispose]:()=>{}}}destroy(t){if(this[x])return t?this.emit("error",t):this.emit(x),this;this[x]=true,this[M]=true,this[C].length=0,this[T]=0;let e=this;return typeof e.close=="function"&&!this[Rt]&&e.close(),t?this.emit("error",t):this.emit(x),this}static get isStream(){return oi}};var vi=realpathSync.native,wt={lstatSync:lstatSync,readdir:readdir$2,readdirSync:readdirSync,readlinkSync:readlinkSync,realpathSync:vi,promises:{lstat:lstat$1,readdir:readdir$1,readlink:readlink,realpath:realpath}},Ue=n=>!n||n===wt||n===xi?wt:{...wt,...n,promises:{...wt.promises,...n.promises||{}}},$e=/^\\\\\?\\([a-z]:)\\?$/i,Ri=n=>n.replace(/\//g,"\\").replace($e,"$1\\"),Oi=/[\\\/]/,L=0,Ge=1,He=2,U=4,qe=6,Ke=8,X=10,Ve=12,_=15,gt=~_,se=16,je=32,yt=64,j=128,Nt=256,Lt=512,Ie=yt|j|Lt,Fi=1023,ie=n=>n.isFile()?Ke:n.isDirectory()?U:n.isSymbolicLink()?X:n.isCharacterDevice()?He:n.isBlockDevice()?qe:n.isSocket()?Ve:n.isFIFO()?Ge:L,ze=new ft({max:2**12}),bt=n=>{let t=ze.get(n);if(t)return t;let e=n.normalize("NFKD");return ze.set(n,e),e},Be=new ft({max:2**12}),_t=n=>{let t=Be.get(n);if(t)return t;let e=bt(n.toLowerCase());return Be.set(n,e),e},Wt=class extends ft{constructor(){super({max:256});}},ne=class extends ft{constructor(t=16*1024){super({maxSize:t,sizeCalculation:e=>e.length+1});}},Ye=Symbol("PathScurry setAsCwd"),R=class{name;root;roots;parent;nocase;isCWD=false;#t;#s;get dev(){return this.#s}#n;get mode(){return this.#n}#r;get nlink(){return this.#r}#o;get uid(){return this.#o}#S;get gid(){return this.#S}#w;get rdev(){return this.#w}#c;get blksize(){return this.#c}#h;get ino(){return this.#h}#u;get size(){return this.#u}#f;get blocks(){return this.#f}#a;get atimeMs(){return this.#a}#i;get mtimeMs(){return this.#i}#d;get ctimeMs(){return this.#d}#E;get birthtimeMs(){return this.#E}#b;get atime(){return this.#b}#p;get mtime(){return this.#p}#R;get ctime(){return this.#R}#m;get birthtime(){return this.#m}#C;#T;#g;#y;#x;#A;#e;#_;#M;#k;get parentPath(){return (this.parent||this).fullpath()}get path(){return this.parentPath}constructor(t,e=L,s,i,r,o,h){this.name=t,this.#C=r?_t(t):bt(t),this.#e=e&Fi,this.nocase=r,this.roots=i,this.root=s||this,this.#_=o,this.#g=h.fullpath,this.#x=h.relative,this.#A=h.relativePosix,this.parent=h.parent,this.parent?this.#t=this.parent.#t:this.#t=Ue(h.fs);}depth(){return this.#T!==void 0?this.#T:this.parent?this.#T=this.parent.depth()+1:this.#T=0}childrenCache(){return this.#_}resolve(t){if(!t)return this;let e=this.getRootString(t),i=t.substring(e.length).split(this.splitSep);return e?this.getRoot(e).#N(i):this.#N(i)}#N(t){let e=this;for(let s of t)e=e.child(s);return e}children(){let t=this.#_.get(this);if(t)return t;let e=Object.assign([],{provisional:0});return this.#_.set(this,e),this.#e&=~se,e}child(t,e){if(t===""||t===".")return this;if(t==="..")return this.parent||this;let s=this.children(),i=this.nocase?_t(t):bt(t);for(let a of s)if(a.#C===i)return a;let r=this.parent?this.sep:"",o=this.#g?this.#g+r+t:void 0,h=this.newChild(t,L,{...e,parent:this,fullpath:o});return this.canReaddir()||(h.#e|=j),s.push(h),h}relative(){if(this.isCWD)return "";if(this.#x!==void 0)return this.#x;let t=this.name,e=this.parent;if(!e)return this.#x=this.name;let s=e.relative();return s+(!s||!e.parent?"":this.sep)+t}relativePosix(){if(this.sep==="/")return this.relative();if(this.isCWD)return "";if(this.#A!==void 0)return this.#A;let t=this.name,e=this.parent;if(!e)return this.#A=this.fullpathPosix();let s=e.relativePosix();return s+(!s||!e.parent?"":"/")+t}fullpath(){if(this.#g!==void 0)return this.#g;let t=this.name,e=this.parent;if(!e)return this.#g=this.name;let i=e.fullpath()+(e.parent?this.sep:"")+t;return this.#g=i}fullpathPosix(){if(this.#y!==void 0)return this.#y;if(this.sep==="/")return this.#y=this.fullpath();if(!this.parent){let i=this.fullpath().replace(/\\/g,"/");return /^[a-z]:\//i.test(i)?this.#y=`//?/${i}`:this.#y=i}let t=this.parent,e=t.fullpathPosix(),s=e+(!e||!t.parent?"":"/")+this.name;return this.#y=s}isUnknown(){return (this.#e&_)===L}isType(t){return this[`is${t}`]()}getType(){return this.isUnknown()?"Unknown":this.isDirectory()?"Directory":this.isFile()?"File":this.isSymbolicLink()?"SymbolicLink":this.isFIFO()?"FIFO":this.isCharacterDevice()?"CharacterDevice":this.isBlockDevice()?"BlockDevice":this.isSocket()?"Socket":"Unknown"}isFile(){return (this.#e&_)===Ke}isDirectory(){return (this.#e&_)===U}isCharacterDevice(){return (this.#e&_)===He}isBlockDevice(){return (this.#e&_)===qe}isFIFO(){return (this.#e&_)===Ge}isSocket(){return (this.#e&_)===Ve}isSymbolicLink(){return (this.#e&X)===X}lstatCached(){return this.#e&je?this:void 0}readlinkCached(){return this.#M}realpathCached(){return this.#k}readdirCached(){let t=this.children();return t.slice(0,t.provisional)}canReadlink(){if(this.#M)return  true;if(!this.parent)return  false;let t=this.#e&_;return !(t!==L&&t!==X||this.#e&Nt||this.#e&j)}calledReaddir(){return !!(this.#e&se)}isENOENT(){return !!(this.#e&j)}isNamed(t){return this.nocase?this.#C===_t(t):this.#C===bt(t)}async readlink(){let t=this.#M;if(t)return t;if(this.canReadlink()&&this.parent)try{let e=await this.#t.promises.readlink(this.fullpath()),s=(await this.parent.realpath())?.resolve(e);if(s)return this.#M=s}catch(e){this.#D(e.code);return}}readlinkSync(){let t=this.#M;if(t)return t;if(this.canReadlink()&&this.parent)try{let e=this.#t.readlinkSync(this.fullpath()),s=this.parent.realpathSync()?.resolve(e);if(s)return this.#M=s}catch(e){this.#D(e.code);return}}#j(t){this.#e|=se;for(let e=t.provisional;e<t.length;e++){let s=t[e];s&&s.#v();}}#v(){this.#e&j||(this.#e=(this.#e|j)&gt,this.#G());}#G(){let t=this.children();t.provisional=0;for(let e of t)e.#v();}#P(){this.#e|=Lt,this.#L();}#L(){if(this.#e&yt)return;let t=this.#e;(t&_)===U&&(t&=gt),this.#e=t|yt,this.#G();}#I(t=""){t==="ENOTDIR"||t==="EPERM"?this.#L():t==="ENOENT"?this.#v():this.children().provisional=0;}#F(t=""){t==="ENOTDIR"?this.parent.#L():t==="ENOENT"&&this.#v();}#D(t=""){let e=this.#e;e|=Nt,t==="ENOENT"&&(e|=j),(t==="EINVAL"||t==="UNKNOWN")&&(e&=gt),this.#e=e,t==="ENOTDIR"&&this.parent&&this.parent.#L();}#z(t,e){return this.#U(t,e)||this.#B(t,e)}#B(t,e){let s=ie(t),i=this.newChild(t.name,s,{parent:this}),r=i.#e&_;return r!==U&&r!==X&&r!==L&&(i.#e|=yt),e.unshift(i),e.provisional++,i}#U(t,e){for(let s=e.provisional;s<e.length;s++){let i=e[s];if((this.nocase?_t(t.name):bt(t.name))===i.#C)return this.#l(t,i,s,e)}}#l(t,e,s,i){let r=e.name;return e.#e=e.#e&gt|ie(t),r!==t.name&&(e.name=t.name),s!==i.provisional&&(s===i.length-1?i.pop():i.splice(s,1),i.unshift(e)),i.provisional++,e}async lstat(){if((this.#e&j)===0)try{return this.#$(await this.#t.promises.lstat(this.fullpath())),this}catch(t){this.#F(t.code);}}lstatSync(){if((this.#e&j)===0)try{return this.#$(this.#t.lstatSync(this.fullpath())),this}catch(t){this.#F(t.code);}}#$(t){let{atime:e,atimeMs:s,birthtime:i,birthtimeMs:r,blksize:o,blocks:h,ctime:a,ctimeMs:l,dev:u,gid:c,ino:d,mode:f,mtime:m,mtimeMs:p,nlink:w,rdev:g,size:S,uid:E}=t;this.#b=e,this.#a=s,this.#m=i,this.#E=r,this.#c=o,this.#f=h,this.#R=a,this.#d=l,this.#s=u,this.#S=c,this.#h=d,this.#n=f,this.#p=m,this.#i=p,this.#r=w,this.#w=g,this.#u=S,this.#o=E;let y=ie(t);this.#e=this.#e&gt|y|je,y!==L&&y!==U&&y!==X&&(this.#e|=yt);}#W=[];#O=false;#H(t){this.#O=false;let e=this.#W.slice();this.#W.length=0,e.forEach(s=>s(null,t));}readdirCB(t,e=false){if(!this.canReaddir()){e?t(null,[]):queueMicrotask(()=>t(null,[]));return}let s=this.children();if(this.calledReaddir()){let r=s.slice(0,s.provisional);e?t(null,r):queueMicrotask(()=>t(null,r));return}if(this.#W.push(t),this.#O)return;this.#O=true;let i=this.fullpath();this.#t.readdir(i,{withFileTypes:true},(r,o)=>{if(r)this.#I(r.code),s.provisional=0;else {for(let h of o)this.#z(h,s);this.#j(s);}this.#H(s.slice(0,s.provisional));});}#q;async readdir(){if(!this.canReaddir())return [];let t=this.children();if(this.calledReaddir())return t.slice(0,t.provisional);let e=this.fullpath();if(this.#q)await this.#q;else {let s=()=>{};this.#q=new Promise(i=>s=i);try{for(let i of await this.#t.promises.readdir(e,{withFileTypes:!0}))this.#z(i,t);this.#j(t);}catch(i){this.#I(i.code),t.provisional=0;}this.#q=void 0,s();}return t.slice(0,t.provisional)}readdirSync(){if(!this.canReaddir())return [];let t=this.children();if(this.calledReaddir())return t.slice(0,t.provisional);let e=this.fullpath();try{for(let s of this.#t.readdirSync(e,{withFileTypes:!0}))this.#z(s,t);this.#j(t);}catch(s){this.#I(s.code),t.provisional=0;}return t.slice(0,t.provisional)}canReaddir(){if(this.#e&Ie)return  false;let t=_&this.#e;return t===L||t===U||t===X}shouldWalk(t,e){return (this.#e&U)===U&&!(this.#e&Ie)&&!t.has(this)&&(!e||e(this))}async realpath(){if(this.#k)return this.#k;if(!((Lt|Nt|j)&this.#e))try{let t=await this.#t.promises.realpath(this.fullpath());return this.#k=this.resolve(t)}catch{this.#P();}}realpathSync(){if(this.#k)return this.#k;if(!((Lt|Nt|j)&this.#e))try{let t=this.#t.realpathSync(this.fullpath());return this.#k=this.resolve(t)}catch{this.#P();}}[Ye](t){if(t===this)return;t.isCWD=false,this.isCWD=true;let e=new Set([]),s=[],i=this;for(;i&&i.parent;)e.add(i),i.#x=s.join(this.sep),i.#A=s.join("/"),i=i.parent,s.push("..");for(i=t;i&&i.parent&&!e.has(i);)i.#x=void 0,i.#A=void 0,i=i.parent;}},Pt=class n extends R{sep="\\";splitSep=Oi;constructor(t,e=L,s,i,r,o,h){super(t,e,s,i,r,o,h);}newChild(t,e=L,s={}){return new n(t,e,this.root,this.roots,this.nocase,this.childrenCache(),s)}getRootString(t){return win32.parse(t).root}getRoot(t){if(t=Ri(t.toUpperCase()),t===this.root.name)return this.root;for(let[e,s]of Object.entries(this.roots))if(this.sameRoot(t,e))return this.roots[t]=s;return this.roots[t]=new it(t,this).root}sameRoot(t,e=this.root.name){return t=t.toUpperCase().replace(/\//g,"\\").replace($e,"$1\\"),t===e}},jt=class n extends R{splitSep="/";sep="/";constructor(t,e=L,s,i,r,o,h){super(t,e,s,i,r,o,h);}getRootString(t){return t.startsWith("/")?"/":""}getRoot(t){return this.root}newChild(t,e=L,s={}){return new n(t,e,this.root,this.roots,this.nocase,this.childrenCache(),s)}},It=class{root;rootPath;roots;cwd;#t;#s;#n;nocase;#r;constructor(t=process.cwd(),e,s,{nocase:i,childrenCacheSize:r=16*1024,fs:o=wt}={}){this.#r=Ue(o),(t instanceof URL||t.startsWith("file://"))&&(t=fileURLToPath(t));let h=e.resolve(t);this.roots=Object.create(null),this.rootPath=this.parseRootPath(h),this.#t=new Wt,this.#s=new Wt,this.#n=new ne(r);let a=h.substring(this.rootPath.length).split(s);if(a.length===1&&!a[0]&&a.pop(),i===void 0)throw new TypeError("must provide nocase setting to PathScurryBase ctor");this.nocase=i,this.root=this.newRoot(this.#r),this.roots[this.rootPath]=this.root;let l=this.root,u=a.length-1,c=e.sep,d=this.rootPath,f=false;for(let m of a){let p=u--;l=l.child(m,{relative:new Array(p).fill("..").join(c),relativePosix:new Array(p).fill("..").join("/"),fullpath:d+=(f?"":c)+m}),f=true;}this.cwd=l;}depth(t=this.cwd){return typeof t=="string"&&(t=this.cwd.resolve(t)),t.depth()}childrenCache(){return this.#n}resolve(...t){let e="";for(let r=t.length-1;r>=0;r--){let o=t[r];if(!(!o||o===".")&&(e=e?`${o}/${e}`:o,this.isAbsolute(o)))break}let s=this.#t.get(e);if(s!==void 0)return s;let i=this.cwd.resolve(e).fullpath();return this.#t.set(e,i),i}resolvePosix(...t){let e="";for(let r=t.length-1;r>=0;r--){let o=t[r];if(!(!o||o===".")&&(e=e?`${o}/${e}`:o,this.isAbsolute(o)))break}let s=this.#s.get(e);if(s!==void 0)return s;let i=this.cwd.resolve(e).fullpathPosix();return this.#s.set(e,i),i}relative(t=this.cwd){return typeof t=="string"&&(t=this.cwd.resolve(t)),t.relative()}relativePosix(t=this.cwd){return typeof t=="string"&&(t=this.cwd.resolve(t)),t.relativePosix()}basename(t=this.cwd){return typeof t=="string"&&(t=this.cwd.resolve(t)),t.name}dirname(t=this.cwd){return typeof t=="string"&&(t=this.cwd.resolve(t)),(t.parent||t).fullpath()}async readdir(t=this.cwd,e={withFileTypes:true}){typeof t=="string"?t=this.cwd.resolve(t):t instanceof R||(e=t,t=this.cwd);let{withFileTypes:s}=e;if(t.canReaddir()){let i=await t.readdir();return s?i:i.map(r=>r.name)}else return []}readdirSync(t=this.cwd,e={withFileTypes:true}){typeof t=="string"?t=this.cwd.resolve(t):t instanceof R||(e=t,t=this.cwd);let{withFileTypes:s=true}=e;return t.canReaddir()?s?t.readdirSync():t.readdirSync().map(i=>i.name):[]}async lstat(t=this.cwd){return typeof t=="string"&&(t=this.cwd.resolve(t)),t.lstat()}lstatSync(t=this.cwd){return typeof t=="string"&&(t=this.cwd.resolve(t)),t.lstatSync()}async readlink(t=this.cwd,{withFileTypes:e}={withFileTypes:false}){typeof t=="string"?t=this.cwd.resolve(t):t instanceof R||(e=t.withFileTypes,t=this.cwd);let s=await t.readlink();return e?s:s?.fullpath()}readlinkSync(t=this.cwd,{withFileTypes:e}={withFileTypes:false}){typeof t=="string"?t=this.cwd.resolve(t):t instanceof R||(e=t.withFileTypes,t=this.cwd);let s=t.readlinkSync();return e?s:s?.fullpath()}async realpath(t=this.cwd,{withFileTypes:e}={withFileTypes:false}){typeof t=="string"?t=this.cwd.resolve(t):t instanceof R||(e=t.withFileTypes,t=this.cwd);let s=await t.realpath();return e?s:s?.fullpath()}realpathSync(t=this.cwd,{withFileTypes:e}={withFileTypes:false}){typeof t=="string"?t=this.cwd.resolve(t):t instanceof R||(e=t.withFileTypes,t=this.cwd);let s=t.realpathSync();return e?s:s?.fullpath()}async walk(t=this.cwd,e={}){typeof t=="string"?t=this.cwd.resolve(t):t instanceof R||(e=t,t=this.cwd);let{withFileTypes:s=true,follow:i=false,filter:r,walkFilter:o}=e,h=[];(!r||r(t))&&h.push(s?t:t.fullpath());let a=new Set,l=(c,d)=>{a.add(c),c.readdirCB((f,m)=>{if(f)return d(f);let p=m.length;if(!p)return d();let w=()=>{--p===0&&d();};for(let g of m)(!r||r(g))&&h.push(s?g:g.fullpath()),i&&g.isSymbolicLink()?g.realpath().then(S=>S?.isUnknown()?S.lstat():S).then(S=>S?.shouldWalk(a,o)?l(S,w):w()):g.shouldWalk(a,o)?l(g,w):w();},true);},u=t;return new Promise((c,d)=>{l(u,f=>{if(f)return d(f);c(h);});})}walkSync(t=this.cwd,e={}){typeof t=="string"?t=this.cwd.resolve(t):t instanceof R||(e=t,t=this.cwd);let{withFileTypes:s=true,follow:i=false,filter:r,walkFilter:o}=e,h=[];(!r||r(t))&&h.push(s?t:t.fullpath());let a=new Set([t]);for(let l of a){let u=l.readdirSync();for(let c of u){(!r||r(c))&&h.push(s?c:c.fullpath());let d=c;if(c.isSymbolicLink()){if(!(i&&(d=c.realpathSync())))continue;d.isUnknown()&&d.lstatSync();}d.shouldWalk(a,o)&&a.add(d);}}return h}[Symbol.asyncIterator](){return this.iterate()}iterate(t=this.cwd,e={}){return typeof t=="string"?t=this.cwd.resolve(t):t instanceof R||(e=t,t=this.cwd),this.stream(t,e)[Symbol.asyncIterator]()}[Symbol.iterator](){return this.iterateSync()}*iterateSync(t=this.cwd,e={}){typeof t=="string"?t=this.cwd.resolve(t):t instanceof R||(e=t,t=this.cwd);let{withFileTypes:s=true,follow:i=false,filter:r,walkFilter:o}=e;(!r||r(t))&&(yield s?t:t.fullpath());let h=new Set([t]);for(let a of h){let l=a.readdirSync();for(let u of l){(!r||r(u))&&(yield s?u:u.fullpath());let c=u;if(u.isSymbolicLink()){if(!(i&&(c=u.realpathSync())))continue;c.isUnknown()&&c.lstatSync();}c.shouldWalk(h,o)&&h.add(c);}}}stream(t=this.cwd,e={}){typeof t=="string"?t=this.cwd.resolve(t):t instanceof R||(e=t,t=this.cwd);let{withFileTypes:s=true,follow:i=false,filter:r,walkFilter:o}=e,h=new V({objectMode:true});(!r||r(t))&&h.write(s?t:t.fullpath());let a=new Set,l=[t],u=0,c=()=>{let d=false;for(;!d;){let f=l.shift();if(!f){u===0&&h.end();return}u++,a.add(f);let m=(w,g,S=false)=>{if(w)return h.emit("error",w);if(i&&!S){let E=[];for(let y of g)y.isSymbolicLink()&&E.push(y.realpath().then(b=>b?.isUnknown()?b.lstat():b));if(E.length){Promise.all(E).then(()=>m(null,g,true));return}}for(let E of g)E&&(!r||r(E))&&(h.write(s?E:E.fullpath())||(d=true));u--;for(let E of g){let y=E.realpathCached()||E;y.shouldWalk(a,o)&&l.push(y);}d&&!h.flowing?h.once("drain",c):p||c();},p=true;f.readdirCB(m,true),p=false;}};return c(),h}streamSync(t=this.cwd,e={}){typeof t=="string"?t=this.cwd.resolve(t):t instanceof R||(e=t,t=this.cwd);let{withFileTypes:s=true,follow:i=false,filter:r,walkFilter:o}=e,h=new V({objectMode:true}),a=new Set;(!r||r(t))&&h.write(s?t:t.fullpath());let l=[t],u=0,c=()=>{let d=false;for(;!d;){let f=l.shift();if(!f){u===0&&h.end();return}u++,a.add(f);let m=f.readdirSync();for(let p of m)(!r||r(p))&&(h.write(s?p:p.fullpath())||(d=true));u--;for(let p of m){let w=p;if(p.isSymbolicLink()){if(!(i&&(w=p.realpathSync())))continue;w.isUnknown()&&w.lstatSync();}w.shouldWalk(a,o)&&l.push(w);}}d&&!h.flowing&&h.once("drain",c);};return c(),h}chdir(t=this.cwd){let e=this.cwd;this.cwd=typeof t=="string"?this.cwd.resolve(t):t,this.cwd[Ye](e);}},it=class extends It{sep="\\";constructor(t=process.cwd(),e={}){let{nocase:s=true}=e;super(t,win32,"\\",{...e,nocase:s}),this.nocase=s;for(let i=this.cwd;i;i=i.parent)i.nocase=this.nocase;}parseRootPath(t){return win32.parse(t).root.toUpperCase()}newRoot(t){return new Pt(this.rootPath,U,void 0,this.roots,this.nocase,this.childrenCache(),{fs:t})}isAbsolute(t){return t.startsWith("/")||t.startsWith("\\")||/^[a-z]:(\/|\\)/i.test(t)}},rt=class extends It{sep="/";constructor(t=process.cwd(),e={}){let{nocase:s=false}=e;super(t,posix,"/",{...e,nocase:s}),this.nocase=s;}parseRootPath(t){return "/"}newRoot(t){return new jt(this.rootPath,U,void 0,this.roots,this.nocase,this.childrenCache(),{fs:t})}isAbsolute(t){return t.startsWith("/")}},St=class extends rt{constructor(t=process.cwd(),e={}){let{nocase:s=true}=e;super(t,{...e,nocase:s});}};process.platform==="win32"?Pt:jt;var Xe=process.platform==="win32"?it:process.platform==="darwin"?St:rt;var Di=n=>n.length>=1,Mi=n=>n.length>=1,Ni=Symbol.for("nodejs.util.inspect.custom"),nt=class n{#t;#s;#n;length;#r;#o;#S;#w;#c;#h;#u=true;constructor(t,e,s,i){if(!Di(t))throw new TypeError("empty pattern list");if(!Mi(e))throw new TypeError("empty glob list");if(e.length!==t.length)throw new TypeError("mismatched pattern list and glob list lengths");if(this.length=t.length,s<0||s>=this.length)throw new TypeError("index out of range");if(this.#t=t,this.#s=e,this.#n=s,this.#r=i,this.#n===0){if(this.isUNC()){let[r,o,h,a,...l]=this.#t,[u,c,d,f,...m]=this.#s;l[0]===""&&(l.shift(),m.shift());let p=[r,o,h,a,""].join("/"),w=[u,c,d,f,""].join("/");this.#t=[p,...l],this.#s=[w,...m],this.length=this.#t.length;}else if(this.isDrive()||this.isAbsolute()){let[r,...o]=this.#t,[h,...a]=this.#s;o[0]===""&&(o.shift(),a.shift());let l=r+"/",u=h+"/";this.#t=[l,...o],this.#s=[u,...a],this.length=this.#t.length;}}}[Ni](){return "Pattern <"+this.#s.slice(this.#n).join("/")+">"}pattern(){return this.#t[this.#n]}isString(){return typeof this.#t[this.#n]=="string"}isGlobstar(){return this.#t[this.#n]===A}isRegExp(){return this.#t[this.#n]instanceof RegExp}globString(){return this.#S=this.#S||(this.#n===0?this.isAbsolute()?this.#s[0]+this.#s.slice(1).join("/"):this.#s.join("/"):this.#s.slice(this.#n).join("/"))}hasMore(){return this.length>this.#n+1}rest(){return this.#o!==void 0?this.#o:this.hasMore()?(this.#o=new n(this.#t,this.#s,this.#n+1,this.#r),this.#o.#h=this.#h,this.#o.#c=this.#c,this.#o.#w=this.#w,this.#o):this.#o=null}isUNC(){let t=this.#t;return this.#c!==void 0?this.#c:this.#c=this.#r==="win32"&&this.#n===0&&t[0]===""&&t[1]===""&&typeof t[2]=="string"&&!!t[2]&&typeof t[3]=="string"&&!!t[3]}isDrive(){let t=this.#t;return this.#w!==void 0?this.#w:this.#w=this.#r==="win32"&&this.#n===0&&this.length>1&&typeof t[0]=="string"&&/^[a-z]:$/i.test(t[0])}isAbsolute(){let t=this.#t;return this.#h!==void 0?this.#h:this.#h=t[0]===""&&t.length>1||this.isDrive()||this.isUNC()}root(){let t=this.#t[0];return typeof t=="string"&&this.isAbsolute()&&this.#n===0?t:""}checkFollowGlobstar(){return !(this.#n===0||!this.isGlobstar()||!this.#u)}markFollowGlobstar(){return this.#n===0||!this.isGlobstar()||!this.#u?false:(this.#u=false,true)}};var _i=typeof process=="object"&&process&&typeof process.platform=="string"?process.platform:"linux",ot=class{relative;relativeChildren;absolute;absoluteChildren;platform;mmopts;constructor(t,{nobrace:e,nocase:s,noext:i,noglobstar:r,platform:o=_i}){this.relative=[],this.absolute=[],this.relativeChildren=[],this.absoluteChildren=[],this.platform=o,this.mmopts={dot:true,nobrace:e,nocase:s,noext:i,noglobstar:r,optimizationLevel:2,platform:o,nocomment:true,nonegate:true};for(let h of t)this.add(h);}add(t){let e=new D(t,this.mmopts);for(let s=0;s<e.set.length;s++){let i=e.set[s],r=e.globParts[s];if(!i||!r)throw new Error("invalid pattern object");for(;i[0]==="."&&r[0]===".";)i.shift(),r.shift();let o=new nt(i,r,0,this.platform),h=new D(o.globString(),this.mmopts),a=r[r.length-1]==="**",l=o.isAbsolute();l?this.absolute.push(h):this.relative.push(h),a&&(l?this.absoluteChildren.push(h):this.relativeChildren.push(h));}}ignored(t){let e=t.fullpath(),s=`${e}/`,i=t.relative()||".",r=`${i}/`;for(let o of this.relative)if(o.match(i)||o.match(r))return  true;for(let o of this.absolute)if(o.match(e)||o.match(s))return  true;return  false}childrenIgnored(t){let e=t.fullpath()+"/",s=(t.relative()||".")+"/";for(let i of this.relativeChildren)if(i.match(s))return  true;for(let i of this.absoluteChildren)if(i.match(e))return  true;return  false}};var oe=class n{store;constructor(t=new Map){this.store=t;}copy(){return new n(new Map(this.store))}hasWalked(t,e){return this.store.get(t.fullpath())?.has(e.globString())}storeWalked(t,e){let s=t.fullpath(),i=this.store.get(s);i?i.add(e.globString()):this.store.set(s,new Set([e.globString()]));}},he=class{store=new Map;add(t,e,s){let i=(e?2:0)|(s?1:0),r=this.store.get(t);this.store.set(t,r===void 0?i:i&r);}entries(){return [...this.store.entries()].map(([t,e])=>[t,!!(e&2),!!(e&1)])}},ae=class{store=new Map;add(t,e){if(!t.canReaddir())return;let s=this.store.get(t);s?s.find(i=>i.globString()===e.globString())||s.push(e):this.store.set(t,[e]);}get(t){let e=this.store.get(t);if(!e)throw new Error("attempting to walk unknown path");return e}entries(){return this.keys().map(t=>[t,this.store.get(t)])}keys(){return [...this.store.keys()].filter(t=>t.canReaddir())}},Et=class n{hasWalkedCache;matches=new he;subwalks=new ae;patterns;follow;dot;opts;constructor(t,e){this.opts=t,this.follow=!!t.follow,this.dot=!!t.dot,this.hasWalkedCache=e?e.copy():new oe;}processPatterns(t,e){this.patterns=e;let s=e.map(i=>[t,i]);for(let[i,r]of s){this.hasWalkedCache.storeWalked(i,r);let o=r.root(),h=r.isAbsolute()&&this.opts.absolute!==false;if(o){i=i.resolve(o==="/"&&this.opts.root!==void 0?this.opts.root:o);let c=r.rest();if(c)r=c;else {this.matches.add(i,true,false);continue}}if(i.isENOENT())continue;let a,l,u=false;for(;typeof(a=r.pattern())=="string"&&(l=r.rest());)i=i.resolve(a),r=l,u=true;if(a=r.pattern(),l=r.rest(),u){if(this.hasWalkedCache.hasWalked(i,r))continue;this.hasWalkedCache.storeWalked(i,r);}if(typeof a=="string"){let c=a===".."||a===""||a===".";this.matches.add(i.resolve(a),h,c);continue}else if(a===A){(!i.isSymbolicLink()||this.follow||r.checkFollowGlobstar())&&this.subwalks.add(i,r);let c=l?.pattern(),d=l?.rest();if(!l||(c===""||c===".")&&!d)this.matches.add(i,h,c===""||c===".");else if(c===".."){let f=i.parent||i;d?this.hasWalkedCache.hasWalked(f,d)||this.subwalks.add(f,d):this.matches.add(f,h,true);}}else a instanceof RegExp&&this.subwalks.add(i,r);}return this}subwalkTargets(){return this.subwalks.keys()}child(){return new n(this.opts,this.hasWalkedCache)}filterEntries(t,e){let s=this.subwalks.get(t),i=this.child();for(let r of e)for(let o of s){let h=o.isAbsolute(),a=o.pattern(),l=o.rest();a===A?i.testGlobstar(r,o,l,h):a instanceof RegExp?i.testRegExp(r,a,l,h):i.testString(r,a,l,h);}return i}testGlobstar(t,e,s,i){if((this.dot||!t.name.startsWith("."))&&(e.hasMore()||this.matches.add(t,i,false),t.canReaddir()&&(this.follow||!t.isSymbolicLink()?this.subwalks.add(t,e):t.isSymbolicLink()&&(s&&e.checkFollowGlobstar()?this.subwalks.add(t,s):e.markFollowGlobstar()&&this.subwalks.add(t,e)))),s){let r=s.pattern();if(typeof r=="string"&&r!==".."&&r!==""&&r!==".")this.testString(t,r,s.rest(),i);else if(r===".."){let o=t.parent||t;this.subwalks.add(o,s);}else r instanceof RegExp&&this.testRegExp(t,r,s.rest(),i);}}testRegExp(t,e,s,i){e.test(t.name)&&(s?this.subwalks.add(t,s):this.matches.add(t,i,false));}testString(t,e,s,i){t.isNamed(e)&&(s?this.subwalks.add(t,s):this.matches.add(t,i,false));}};var Li=(n,t)=>typeof n=="string"?new ot([n],t):Array.isArray(n)?new ot(n,t):n,zt=class{path;patterns;opts;seen=new Set;paused=false;aborted=false;#t=[];#s;#n;signal;maxDepth;includeChildMatches;constructor(t,e,s){if(this.patterns=t,this.path=e,this.opts=s,this.#n=!s.posix&&s.platform==="win32"?"\\":"/",this.includeChildMatches=s.includeChildMatches!==false,(s.ignore||!this.includeChildMatches)&&(this.#s=Li(s.ignore??[],s),!this.includeChildMatches&&typeof this.#s.add!="function")){let i="cannot ignore child matches, ignore lacks add() method.";throw new Error(i)}this.maxDepth=s.maxDepth||1/0,s.signal&&(this.signal=s.signal,this.signal.addEventListener("abort",()=>{this.#t.length=0;}));}#r(t){return this.seen.has(t)||!!this.#s?.ignored?.(t)}#o(t){return !!this.#s?.childrenIgnored?.(t)}pause(){this.paused=true;}resume(){if(this.signal?.aborted)return;this.paused=false;let t;for(;!this.paused&&(t=this.#t.shift());)t();}onResume(t){this.signal?.aborted||(this.paused?this.#t.push(t):t());}async matchCheck(t,e){if(e&&this.opts.nodir)return;let s;if(this.opts.realpath){if(s=t.realpathCached()||await t.realpath(),!s)return;t=s;}let r=t.isUnknown()||this.opts.stat?await t.lstat():t;if(this.opts.follow&&this.opts.nodir&&r?.isSymbolicLink()){let o=await r.realpath();o&&(o.isUnknown()||this.opts.stat)&&await o.lstat();}return this.matchCheckTest(r,e)}matchCheckTest(t,e){return t&&(this.maxDepth===1/0||t.depth()<=this.maxDepth)&&(!e||t.canReaddir())&&(!this.opts.nodir||!t.isDirectory())&&(!this.opts.nodir||!this.opts.follow||!t.isSymbolicLink()||!t.realpathCached()?.isDirectory())&&!this.#r(t)?t:void 0}matchCheckSync(t,e){if(e&&this.opts.nodir)return;let s;if(this.opts.realpath){if(s=t.realpathCached()||t.realpathSync(),!s)return;t=s;}let r=t.isUnknown()||this.opts.stat?t.lstatSync():t;if(this.opts.follow&&this.opts.nodir&&r?.isSymbolicLink()){let o=r.realpathSync();o&&(o?.isUnknown()||this.opts.stat)&&o.lstatSync();}return this.matchCheckTest(r,e)}matchFinish(t,e){if(this.#r(t))return;if(!this.includeChildMatches&&this.#s?.add){let r=`${t.relativePosix()}/**`;this.#s.add(r);}let s=this.opts.absolute===void 0?e:this.opts.absolute;this.seen.add(t);let i=this.opts.mark&&t.isDirectory()?this.#n:"";if(this.opts.withFileTypes)this.matchEmit(t);else if(s){let r=this.opts.posix?t.fullpathPosix():t.fullpath();this.matchEmit(r+i);}else {let r=this.opts.posix?t.relativePosix():t.relative(),o=this.opts.dotRelative&&!r.startsWith(".."+this.#n)?"."+this.#n:"";this.matchEmit(r?o+r+i:"."+i);}}async match(t,e,s){let i=await this.matchCheck(t,s);i&&this.matchFinish(i,e);}matchSync(t,e,s){let i=this.matchCheckSync(t,s);i&&this.matchFinish(i,e);}walkCB(t,e,s){this.signal?.aborted&&s(),this.walkCB2(t,e,new Et(this.opts),s);}walkCB2(t,e,s,i){if(this.#o(t))return i();if(this.signal?.aborted&&i(),this.paused){this.onResume(()=>this.walkCB2(t,e,s,i));return}s.processPatterns(t,e);let r=1,o=()=>{--r===0&&i();};for(let[h,a,l]of s.matches.entries())this.#r(h)||(r++,this.match(h,a,l).then(()=>o()));for(let h of s.subwalkTargets()){if(this.maxDepth!==1/0&&h.depth()>=this.maxDepth)continue;r++;let a=h.readdirCached();h.calledReaddir()?this.walkCB3(h,a,s,o):h.readdirCB((l,u)=>this.walkCB3(h,u,s,o),true);}o();}walkCB3(t,e,s,i){s=s.filterEntries(t,e);let r=1,o=()=>{--r===0&&i();};for(let[h,a,l]of s.matches.entries())this.#r(h)||(r++,this.match(h,a,l).then(()=>o()));for(let[h,a]of s.subwalks.entries())r++,this.walkCB2(h,a,s.child(),o);o();}walkCBSync(t,e,s){this.signal?.aborted&&s(),this.walkCB2Sync(t,e,new Et(this.opts),s);}walkCB2Sync(t,e,s,i){if(this.#o(t))return i();if(this.signal?.aborted&&i(),this.paused){this.onResume(()=>this.walkCB2Sync(t,e,s,i));return}s.processPatterns(t,e);let r=1,o=()=>{--r===0&&i();};for(let[h,a,l]of s.matches.entries())this.#r(h)||this.matchSync(h,a,l);for(let h of s.subwalkTargets()){if(this.maxDepth!==1/0&&h.depth()>=this.maxDepth)continue;r++;let a=h.readdirSync();this.walkCB3Sync(h,a,s,o);}o();}walkCB3Sync(t,e,s,i){s=s.filterEntries(t,e);let r=1,o=()=>{--r===0&&i();};for(let[h,a,l]of s.matches.entries())this.#r(h)||this.matchSync(h,a,l);for(let[h,a]of s.subwalks.entries())r++,this.walkCB2Sync(h,a,s.child(),o);o();}},xt=class extends zt{matches=new Set;constructor(t,e,s){super(t,e,s);}matchEmit(t){this.matches.add(t);}async walk(){if(this.signal?.aborted)throw this.signal.reason;return this.path.isUnknown()&&await this.path.lstat(),await new Promise((t,e)=>{this.walkCB(this.path,this.patterns,()=>{this.signal?.aborted?e(this.signal.reason):t(this.matches);});}),this.matches}walkSync(){if(this.signal?.aborted)throw this.signal.reason;return this.path.isUnknown()&&this.path.lstatSync(),this.walkCBSync(this.path,this.patterns,()=>{if(this.signal?.aborted)throw this.signal.reason}),this.matches}},vt=class extends zt{results;constructor(t,e,s){super(t,e,s),this.results=new V({signal:this.signal,objectMode:true}),this.results.on("drain",()=>this.resume()),this.results.on("resume",()=>this.resume());}matchEmit(t){this.results.write(t),this.results.flowing||this.pause();}stream(){let t=this.path;return t.isUnknown()?t.lstat().then(()=>{this.walkCB(t,this.patterns,()=>this.results.end());}):this.walkCB(t,this.patterns,()=>this.results.end()),this.results}streamSync(){return this.path.isUnknown()&&this.path.lstatSync(),this.walkCBSync(this.path,this.patterns,()=>this.results.end()),this.results}};var Pi=typeof process=="object"&&process&&typeof process.platform=="string"?process.platform:"linux",I=class{absolute;cwd;root;dot;dotRelative;follow;ignore;magicalBraces;mark;matchBase;maxDepth;nobrace;nocase;nodir;noext;noglobstar;pattern;platform;realpath;scurry;stat;signal;windowsPathsNoEscape;withFileTypes;includeChildMatches;opts;patterns;constructor(t,e){if(!e)throw new TypeError("glob options required");if(this.withFileTypes=!!e.withFileTypes,this.signal=e.signal,this.follow=!!e.follow,this.dot=!!e.dot,this.dotRelative=!!e.dotRelative,this.nodir=!!e.nodir,this.mark=!!e.mark,e.cwd?(e.cwd instanceof URL||e.cwd.startsWith("file://"))&&(e.cwd=fileURLToPath(e.cwd)):this.cwd="",this.cwd=e.cwd||"",this.root=e.root,this.magicalBraces=!!e.magicalBraces,this.nobrace=!!e.nobrace,this.noext=!!e.noext,this.realpath=!!e.realpath,this.absolute=e.absolute,this.includeChildMatches=e.includeChildMatches!==false,this.noglobstar=!!e.noglobstar,this.matchBase=!!e.matchBase,this.maxDepth=typeof e.maxDepth=="number"?e.maxDepth:1/0,this.stat=!!e.stat,this.ignore=e.ignore,this.withFileTypes&&this.absolute!==void 0)throw new Error("cannot set absolute and withFileTypes:true");if(typeof t=="string"&&(t=[t]),this.windowsPathsNoEscape=!!e.windowsPathsNoEscape||e.allowWindowsEscape===false,this.windowsPathsNoEscape&&(t=t.map(a=>a.replace(/\\/g,"/"))),this.matchBase){if(e.noglobstar)throw new TypeError("base matching requires globstar");t=t.map(a=>a.includes("/")?a:`./**/${a}`);}if(this.pattern=t,this.platform=e.platform||Pi,this.opts={...e,platform:this.platform},e.scurry){if(this.scurry=e.scurry,e.nocase!==void 0&&e.nocase!==e.scurry.nocase)throw new Error("nocase option contradicts provided scurry option")}else {let a=e.platform==="win32"?it:e.platform==="darwin"?St:e.platform?rt:Xe;this.scurry=new a(this.cwd,{nocase:e.nocase,fs:e.fs});}this.nocase=this.scurry.nocase;let s=this.platform==="darwin"||this.platform==="win32",i={braceExpandMax:1e4,...e,dot:this.dot,matchBase:this.matchBase,nobrace:this.nobrace,nocase:this.nocase,nocaseMagicOnly:s,nocomment:true,noext:this.noext,nonegate:true,optimizationLevel:2,platform:this.platform,windowsPathsNoEscape:this.windowsPathsNoEscape,debug:!!this.opts.debug},r=this.pattern.map(a=>new D(a,i)),[o,h]=r.reduce((a,l)=>(a[0].push(...l.set),a[1].push(...l.globParts),a),[[],[]]);this.patterns=o.map((a,l)=>{let u=h[l];if(!u)throw new Error("invalid pattern object");return new nt(a,u,0,this.platform)});}async walk(){return [...await new xt(this.patterns,this.scurry.cwd,{...this.opts,maxDepth:this.maxDepth!==1/0?this.maxDepth+this.scurry.cwd.depth():1/0,platform:this.platform,nocase:this.nocase,includeChildMatches:this.includeChildMatches}).walk()]}walkSync(){return [...new xt(this.patterns,this.scurry.cwd,{...this.opts,maxDepth:this.maxDepth!==1/0?this.maxDepth+this.scurry.cwd.depth():1/0,platform:this.platform,nocase:this.nocase,includeChildMatches:this.includeChildMatches}).walkSync()]}stream(){return new vt(this.patterns,this.scurry.cwd,{...this.opts,maxDepth:this.maxDepth!==1/0?this.maxDepth+this.scurry.cwd.depth():1/0,platform:this.platform,nocase:this.nocase,includeChildMatches:this.includeChildMatches}).stream()}streamSync(){return new vt(this.patterns,this.scurry.cwd,{...this.opts,maxDepth:this.maxDepth!==1/0?this.maxDepth+this.scurry.cwd.depth():1/0,platform:this.platform,nocase:this.nocase,includeChildMatches:this.includeChildMatches}).streamSync()}iterateSync(){return this.streamSync()[Symbol.iterator]()}[Symbol.iterator](){return this.iterateSync()}iterate(){return this.stream()[Symbol.asyncIterator]()}[Symbol.asyncIterator](){return this.iterate()}};var le=(n,t={})=>{Array.isArray(n)||(n=[n]);for(let e of n)if(new D(e,t).hasMagic())return  true;return  false};function Bt(n,t={}){return new I(n,t).streamSync()}function Qe(n,t={}){return new I(n,t).stream()}function ts(n,t={}){return new I(n,t).walkSync()}async function Je(n,t={}){return new I(n,t).walk()}function Ut(n,t={}){return new I(n,t).iterateSync()}function es(n,t={}){return new I(n,t).iterate()}var ji=Bt,Ii=Object.assign(Qe,{sync:Bt}),zi=Ut,Bi=Object.assign(es,{sync:Ut}),Ui=Object.assign(ts,{stream:Bt,iterate:Ut}),Ze=Object.assign(Je,{glob:Je,globSync:ts,sync:Ui,globStream:Qe,stream:Ii,globStreamSync:Bt,streamSync:ji,globIterate:es,iterate:Bi,globIterateSync:Ut,iterateSync:zi,Glob:I,hasMagic:le,escape:tt,unescape:W});Ze.glob=Ze;
+var re=(r,t,e)=>{let s=r instanceof RegExp?We(r,e):r,i=t instanceof RegExp?We(t,e):t,n=s!==null&&i!=null&&js(s,i,e);return n&&{start:n[0],end:n[1],pre:e.slice(0,n[0]),body:e.slice(n[0]+s.length,n[1]),post:e.slice(n[1]+i.length)}},We=(r,t)=>{let e=t.match(r);return e?e[0]:null},js=(r,t,e)=>{let s,i,n,o,h,a=e.indexOf(r),l=e.indexOf(t,a+1),c=a;if(a>=0&&l>0){if(r===t)return [a,l];for(s=[],n=e.length;c>=0&&!h;){if(c===a)s.push(c),a=e.indexOf(r,c+1);else if(s.length===1){let f=s.pop();f!==void 0&&(h=[f,l]);}else i=s.pop(),i!==void 0&&i<n&&(n=i,o=l),l=e.indexOf(t,c+1);c=a<l&&a>=0?a:l;}s.length&&o!==void 0&&(h=[n,o]);}return h};var $e="\0SLASH"+Math.random()+"\0",Ie="\0OPEN"+Math.random()+"\0",le="\0CLOSE"+Math.random()+"\0",Be="\0COMMA"+Math.random()+"\0",Ue="\0PERIOD"+Math.random()+"\0",Ws=new RegExp($e,"g"),$s=new RegExp(Ie,"g"),Is=new RegExp(le,"g"),Bs=new RegExp(Be,"g"),Us=new RegExp(Ue,"g"),Gs=/\\\\/g,Hs=/\\{/g,qs=/\\}/g,Ks=/\\,/g,Xs=/\\\./g,Vs=1e5,Ys=4e6,Js=1e3,Zs=1e3;function oe(r){return isNaN(r)?r.charCodeAt(0):parseInt(r,10)}function Qs(r){return r.replace(Gs,$e).replace(Hs,Ie).replace(qs,le).replace(Ks,Be).replace(Xs,Ue)}function ti(r){return r.replace(Ws,"\\").replace($s,"{").replace(Is,"}").replace(Bs,",").replace(Us,".")}function he(r,t){for(let e=0;e<t.length;e++)r.push(t[e]);}function ei(r){let t=[],e="";for(;;){let s=re("{","}",r);if(!s){let a=r.split(",");return a[0]=e+a[0],he(t,a),t}let{pre:i,body:n,post:o}=s,h=i.split(",");if(h[0]=e+h[0],h[h.length-1]+="{"+n+"}",!o.length)return he(t,h),t;e=h.pop(),he(t,h),r=o;}}function Ge(r,t={}){if(!r)return [];let{max:e=Vs,maxLength:s=Ys,maxDepth:i=Js,maxRewrites:n=Zs}=t;return r.slice(0,2)==="{}"&&(r="\\{\\}"+r.slice(2)),ae(Qs(r),e,s,i,0,n,true).map(ti)}function si(r){return "{"+r+"}"}function ii(r){return /^-?0\d/.test(r)}function ni(r,t){return r<=t}function ri(r,t){return r>=t}function ct(r,t,e,s,i,n){let o=[],h=0;for(let a=0;a<r.length;a++)for(let l=0;l<e.length;l++){if(o.length>=s)return o;let c=r[a]+t+e[l];if(!(n&&!c)){if(h+c.length>i)return o;o.push(c),h+=c.length;}}return o}function oi(r,t,e,s){let i=r.split(/\.\./),n=[];if(i[0]===void 0||i[1]===void 0)return n;let o=oe(i[0]),h=oe(i[1]),a=Math.max(i[0].length,i[1].length),l=i.length===3&&i[2]!==void 0?Math.max(Math.abs(oe(i[2])),1):1,c=ni;h<o&&(l*=-1,c=ri);let u=i.some(ii),p=0;for(let g=o;c(g,h)&&n.length<e;g+=l){let d;if(t)d=String.fromCharCode(g),d==="\\"&&(d="");else if(d=String(g),u){let w=a-d.length;if(w>0){let m=new Array(w+1).join("0");g<0?d="-"+m+d.slice(1):d=m+d;}}if(p+d.length>s)break;n.push(d),p+=d.length;}return n}function ae(r,t,e,s,i,n,o){if(i>s)return [r];let h=[""],a=0,l=false,c=true;for(;;){let f=re("{","}",r);if(!f)return ct(h,r,[""],t,e,l);let u=f.pre;if(/\$$/.test(u)){if(h=ct(h,u+"{"+f.body+"}",[""],t,e,l&&!f.post.length),c=false,!f.post.length)break;r=f.post;continue}let p=/^-?\d+\.\.-?\d+(?:\.\.-?\d+)?$/.test(f.body),g=/^[a-zA-Z]\.\.[a-zA-Z](?:\.\.-?\d+)?$/.test(f.body),d=p||g,w=f.body.indexOf(",")>=0;if(!d&&!w){if(a<n&&f.post.match(/,(?!,).*\}/)){a++,r=f.pre+"{"+f.body+le+f.post,o=true;continue}return ct(h,u+"{"+f.body+"}"+f.post,[""],t,e,l)}c&&(l=o&&!d,c=false);let m;if(d)m=oi(f.body,g,t,e);else {let b=ei(f.body);if(b.length===1&&b[0]!==void 0&&(b=ae(b[0],t,e,s,i+1,n,false).map(si),b.length===1)){if(h=ct(h,u+b[0],[""],t,e,l&&!f.post.length),!f.post.length)break;r=f.post;continue}let x=l&&!f.post.length&&!u;for(let y=0;x&&y<h.length;y++)h[y]&&(x=false);m=[];let S=0;t:for(let y=0;y<b.length;y++){let q=ae(b[y],t,e,s,i+1,n,false);for(let W=0;W<q.length;W++){let B=q[W];if(!(x&&!B)){if(m.length>=t||S+B.length>e)break t;m.push(B),S+=B.length;}}}}if(h=ct(h,u,m,t,e,l&&!f.post.length),!f.post.length)break;r=f.post;}return h}var fe=(r,t)=>r===t?{t:"lit",ch:String(r)}:{t:"class",re:new RegExp(`^[${r}-${t}]$`)},ce=(r,t)=>t.map(e=>[fe(r,r),...e]),ft=(r,t)=>{if(!r)return [[]];let e=+r[0],s=+t[0],i=r.slice(1),n=t.slice(1);if(e===s)return ce(e,ft(i,n));let o="0".repeat(i.length),h="9".repeat(i.length),a=[];i!==o&&a.push(...ce(e++,ft(i,h)));let l=n===h?[]:ce(s--,ft(o,n));return e<=s&&a.push([fe(e,s),...Array.from(i,()=>fe(0,9))]),a.push(...l),a},He=(r,t,e)=>{if(e)return ft(String(r).padStart(e,"0"),String(t).padStart(e,"0"));let s=[];for(let i=String(r).length;i<=String(t).length;i++){let n=Math.max(r,i===1?0:10**(i-1)),o=Math.min(t,10**i-1);s.push(...ft(String(n),String(o)));}return s},qe=(r,t)=>{let e=Number(r),s=Number(t);if(!Number.isSafeInteger(e)||!Number.isSafeInteger(s))return;e>s&&([e,s]=[s,e]);let n=/^-?0\d/.test(r)||/^-?0\d/.test(t)?Math.max(r.length,t.length):0,o=[];if(e<0){let h=He(Math.max(-s,1),-e,n&&n-1);o.push(...h.map(a=>[{t:"lit",ch:"-"},...a]));}return s>=0&&o.push(...He(Math.max(e,0),s,n)),o};var hi={"[:alnum:]":["\\p{L}\\p{Nl}\\p{Nd}"],"[:alpha:]":["\\p{L}\\p{Nl}"],"[:ascii:]":["\\x00-\\x7f"],"[:blank:]":["\\p{Zs}\\t"],"[:cntrl:]":["\\p{Cc}"],"[:digit:]":["\\p{Nd}"],"[:graph:]":["\\p{Z}\\p{C}",true],"[:lower:]":["\\p{Ll}"],"[:print:]":["\\p{C}",true],"[:punct:]":["\\p{P}\\p{S}"],"[:space:]":["\\p{Z}\\t\\r\\n\\v\\f"],"[:upper:]":["\\p{Lu}"],"[:word:]":["\\p{L}\\p{Nl}\\p{Nd}\\p{Pc}"],"[:xdigit:]":["A-Fa-f0-9"]},ut=r=>r.replace(/[[\]\\-]/g,"\\$&"),ue=/$./,Ke=(r,t,e=false,s)=>{let i=m=>{let b=s?m.normalize(s):m;return [...b].length===1?b:m},n=t;if(r.charAt(n)!=="[")throw new Error("not in a brace expression");let o=[],h=[],a=n+1,l=false,c=false,f=false,u=n,p="";t:for(;a<r.length;){let m=String.fromCodePoint(r.codePointAt(a));if((m==="!"||m==="^")&&a===n+1){f=true,a++;continue}if(m==="]"&&l&&!c){u=a+1;break}if(l=true,m==="\\"&&!c){c=true,a++;continue}if(m==="["&&!c){for(let[x,[S,y]]of Object.entries(hi))if(r.startsWith(x,a)){if(p)return [ue,r.length-n];a+=x.length,y?h.push(S):o.push(S);continue t}}c=false;let b=i(m);if(p){b.codePointAt(0)>p.codePointAt(0)?o.push(ut(p)+"-"+ut(b)):b===p&&o.push(ut(b)),p="",a+=m.length;continue}if(r.startsWith("-]",a+m.length)){o.push(ut(b+"-")),a+=m.length+1;continue}if(r.startsWith("-",a+m.length)){p=b,a+=m.length+1;continue}o.push(ut(b)),a+=m.length;}if(u<a)return [ue,0];if(!o.length&&!h.length)return [ue,r.length-n];let g="["+(f?"^":"")+o.join("")+"]",d="["+(f?"":"^")+h.join("")+"]",w="^"+(o.length&&h.length?"("+g+"|"+d+")":o.length?g:d);return [new RegExp(w,e?"iu":"u"),u-n]};var de={t:"match",id:0},ai="!?+*@",Z=r=>({t:"lit",ch:r}),li=r=>r.replace(/[\\^$.*+?()[\]{}|/]/g,"\\$&"),Je=r=>new RegExp(`^${li(r)}$`,"iu"),Dt=new Map,Ze=r=>{let t=Dt.get(r);return t||(t=Je(r),Dt.size>=1e3&&Dt.clear(),Dt.set(r,t)),t},ge=(r,t)=>{if(t===r.ch)return  true;if(!r.re)return  false;let e=t.charCodeAt(0);if(e>=128)return r.re.test(t);let s=r.ascii??=new Uint8Array(128);return s[e]||=r.re.test(t)?1:2,s[e]===1},ci=(r,t,e,s,i)=>{let n=[];for(let o=0;o<r.length;){let h=String.fromCodePoint(r.codePointAt(o));if(i){let a=h==="\\"&&r.startsWith(i,o+1)?1:0;if(a||h===i){let l=o+a+i.length,c=r.indexOf(i,l),f=/^(-?\d+)\.\.(-?\d+)$/.exec(r.slice(l,c)),u=c!==-1&&f&&qe(f[1],f[2]);if(u){n.push({t:"ext",type:"@",alts:u}),o=c+i.length;continue}}}if(h==="\\"){let a=r.codePointAt(o+1),l=a===void 0?h:String.fromCodePoint(a);n.push(Z(l)),o+=1+l.length;continue}if(h==="["){let[a,l]=Ke(r,o,t,s);if(l){n.push({t:"class",re:a}),o+=l;continue}}if(!e&&ai.includes(h)&&r[o+1]==="("){n.push({t:"open",type:h}),o+=2;continue}n.push(!e&&h==="|"?{t:"bar"}:!e&&h===")"?{t:"close"}:h==="*"?{t:"star"}:h==="?"?{t:"any"}:Z(h)),o+=h.length;}return n},fi=r=>{let t=new Map,e=[];return r.forEach((s,i)=>{s.t==="open"?e.push(i):s.t==="close"&&e.length&&t.set(e.pop(),i);}),t},Qe=(r,t,e,s,i)=>{let n=[],o=[n];for(let h=e;h<s;h++){let a=r[h],l=t.get(h);if(a.t==="open"&&l!==void 0){let c=Qe(r,t,h+1,l,false);n.push({t:"ext",type:a.type,alts:c}),h=l;}else a.t==="bar"&&!i?o.push(n=[]):a.t==="open"?n.push(Z(a.type),Z("(")):a.t==="bar"?n.push(Z("|")):a.t==="close"?n.push(Z(")")):n.push(a);}return o},ts=(r,t)=>{let e=[],s="",i=()=>{for(let n of s.normalize(t))e.push(Z(n));s="";};for(let n of r){if(n.t==="lit"){s+=n.ch;continue}i(),e.push(n.t==="ext"?{...n,alts:n.alts.map(o=>ts(o,t))}:n);}return i(),e},ui=(r,t)=>{let e=1,s=h=>({t:"split",id:e++,out:h}),i=(h,a)=>h.reduceRight((l,c)=>n(c,l),a),n=(h,a)=>{switch(h.t){case "lit":let u=t?Ze(h.ch):void 0;return {t:"lit",id:e++,ch:h.ch,re:u,next:a};case "any":case "star":return {t:h.t,id:e++,next:a};case "class":return {t:"class",id:e++,re:h.re,next:a}}let l=u=>h.alts.map(p=>i(p,u));switch(h.type){case "@":return s(l(a));case "?":return s([a,...l(a)]);case "!":return {t:"neg",id:e++,sub:s(l(de)),next:a}}let c=s([]),f=s(l(c));return c.out.push(a,f),h.type==="*"?c:f};return [i(r,de),e]},di=r=>{let t=[],e=new Set,s=n=>n.t==="match"?"match":String(n.id),i=(n,o)=>{if(n.t==="match"||e.has(n))return;e.add(n);let h=a=>t.push(`${o}${n.id}: ${a}`);switch(n.t){case "split":h(`split -> ${n.out.map(s).join(", ")}`);for(let a of n.out)i(a,o);return;case "neg":return h(`!(${s(n.sub)}) -> ${s(n.next)}`),i(n.sub,o+"  "),i(n.next,o);case "lit":h(`${JSON.stringify(n.ch)} -> ${s(n.next)}`);break;case "class":h(`${n.re} -> ${s(n.next)}`);break;default:h(`${n.t==="any"?"?":"*"} -> ${s(n.next)}`);}i(n.next,o);};return i(r,""),[`start -> ${s(r)}`,...t].join(`
+`)},pe=class{gen;threads=[];match=false;runs=[];ids=[];constructor(t){this.gen=t;}get dead(){return !this.threads.length&&!this.match&&!this.runs.length}},es=(r,t)=>r.ids.length!==t.ids.length||r.runs.length!==t.runs.length||r.ids.some((e,s)=>e!==t.ids[s])?false:r.runs.every(e=>t.runs.some(s=>s.neg===e.neg&&es(s.state,e.state))),Xe=r=>({has:new Float64Array(r),seen:new Float64Array(r),gen:0}),dt=class{dots;dotStart;#t;constructor(t,e,s){this.dots=t,this.dotStart=e,this.#t=s;}state(){return new pe(++this.#t.gen)}done(t){return t.ids=t.threads.map(e=>e.id).sort((e,s)=>e-s),t.match&&t.ids.unshift(de.id),t}#n(t,e){let{seen:s}=this.#t;return s[e.id]===t.gen?false:(s[e.id]=t.gen,true)}#i(t,e){let{has:s}=this.#t;return s[e.id]===t.gen?false:(s[e.id]=t.gen,t.threads.push(e),true)}restricted(t,e){return e&&(this.dots||this.dotStart&&t===0)}add(t,e,s,i){switch(e.t){case "split":if(!this.#n(t,e))return;for(let o of e.out)this.add(t,o,s,i);return;case "neg":if(!this.#n(t,e))return;let n=this.state();return this.add(n,e.sub,s,false),this.done(n),this.addRun(t,{t:"run",neg:e,state:n},s,i);case "star":if(this.restricted(s,i))return;this.#i(t,e)&&this.add(t,e.next,s,i);return;case "match":t.match=true;return;default:this.#i(t,e);}}addRun(t,e,s,i){for(let n of t.runs)if(n.neg===e.neg&&es(n.state,e.state))return;t.runs.push(e),e.state.match||this.add(t,e.neg.next,s,i);}step(t,e,s,i){let n=this.state();for(let o of t.threads)switch(o.t){case "lit":ge(o,e)&&this.add(n,o.next,s+1,i);break;case "any":this.restricted(s,i)||this.add(n,o.next,s+1,i);break;case "class":!this.restricted(s,i)&&o.re.test(e)&&this.add(n,o.next,s+1,i);break;case "star":this.restricted(s,i)||this.add(n,o,s+1,i);}if(!this.restricted(s,i))for(let o of t.runs){if(o.state.dead){this.addRun(n,o,s+1,i);continue}let h=this.step(o.state,e,s,false);this.addRun(n,{t:"run",neg:o.neg,state:h},s+1,i);}return this.done(n)}},ss=r=>{let t=r.ids.join();if(!r.runs.length)return t;let e=r.runs.map(s=>`${s.neg.id}(${ss(s.state)})`);return `${t}|${e.sort().join("|")}`},pi=1<<18,me=class{#t;#n=new Map;#i=0;#o;#r;#d;#u;constructor(t,e){this.#t=t,this.#d=new dt(false,false,e),this.#u=new dt(false,true,e);}#f(t){return {state:t,match:t.match,dead:t.dead,next:new Map}}#h(t){let e=ss(t),s=this.#n.get(e);if(s)return s;this.#i>pi&&this.#m();let i=this.#f(t);return this.#n.set(e,i),this.#i+=e.length+1,i}#m(){this.#n.clear(),this.#i=0,this.#o=void 0,this.#r=void 0;}start(t){if(t){if(this.#r)return this.#r;let s=this.#u.state();return this.#u.add(s,this.#t,0,true),this.#r=this.#f(this.#u.done(s))}if(this.#o)return this.#o;let e=this.#d.state();return this.#d.add(e,this.#t,0,true),this.#o=this.#h(this.#d.done(e))}next(t,e){let s=e.charCodeAt(0),i=s<128?void 0:t.next.get(e);if(i)return i;let n=t===this.#r?this.#h(this.#u.step(t.state,e,0,true)):this.#h(this.#d.step(t.state,e,1,true));return s<128?(t.ascii||(t.ascii=new Array(128),this.#i+=128),t.ascii[s]=n):t.next.set(e,n),this.#i++,n}},mi=r=>{let t=[];for(let e=r;e.t!=="match";e=e.next){if(e.t==="split"||e.t==="neg")return;t.push(e);}return t},gi=(r,t,e,s)=>{let i=0,n=e,o=-1,h=0;for(;n<s;){let a=r[i];if(a?.t==="star"){o=i++,h=n;continue}let l=t[n];if(a&&(a.t==="any"||a.t==="lit"&&ge(a,l)||a.t==="class"&&a.re.test(l))){i++,n++;continue}if(o===-1)return  false;i=o+1,n=++h;}for(;r[i]?.t==="star";)i++;return i===r.length},is=r=>{let t=0,e=0;for(let s of r){let[i,n]=wi(s);t+=i,e+=n;}return [t,e]},wi=r=>{if(r.t==="star")return [0,1/0];if(r.t!=="ext")return [1,1];if(r.type==="!")return [0,1/0];let t=r.alts.map(is),e=Math.min(...t.map(n=>n[0])),s=Math.max(...t.map(n=>n[1])),i=s===0?0:1/0;return r.type==="@"?[e,s]:r.type==="?"?[0,s]:r.type==="*"?[0,i]:[e,i]},Ve=(r,t,e)=>{for(let s=0;s<r.length;s++)if(!ge(r[s],t[e+s]))return  false;return  true},bi=/[/\ud800-\udfff]/,yi=/[\ud800-\udfff]/,Nt=r=>yi.test(r)?[...r]:r,Ye=r=>{if(r.includes("/"))throw new Error("can only match a single path portion, got: "+r)},pt=class{pattern;options;#t;#n;#i;#o;#r;#d=false;#u;#f;#h=false;#m=0;#l=1/0;#a=[];#s=[];#b;#E;#y=false;#g;#w;constructor(t,e={}){if(t.includes("/"))throw new Error("can only match a single path portion, got pattern: "+t);this.pattern=t,this.options=e;let{nocase:s=false,noext:i=false,normalize:n}=e;this.#w=n===true?"NFC":n||void 0;let o=/^[?*+@]\(\)$/.test(t),h=ci(t,s,i||o,this.#w,e.rangeMark),[a]=Qe(h,fi(h),0,h.length,true);this.#w&&(a=ts(a,this.#w));let[l,c]=ui(a,s);if(this.#t=l,this.#n=c,a.every(f=>f.t==="lit"))this.#r=a.map(f=>f.ch).join(""),this.#d=s;else {let f=g=>g.t!=="lit"?void 0:s?{ch:g.ch,re:Ze(g.ch)}:{ch:g.ch};for(let g of a){let d=f(g);if(!d)break;this.#a.push(d);}for(let g=a.length-1;g>=0;g--){let d=f(a[g]);if(!d)break;this.#s.unshift(d);}this.#y=!!(this.#a.length||this.#s.length),s||(this.#b=this.#a.map(g=>g.ch).join(""),this.#E=this.#s.map(g=>g.ch).join("")),this.#f=mi(this.#t)?.slice(this.#a.length,-this.#s.length||void 0),this.#h=!!this.#f?.every(g=>g.t==="star"||g.t==="any");let[u,p]=is(a);this.#m=u,this.#l=p;}}test(t){return this.#w?(Ye(t),this.#p(t.normalize(this.#w))):bi.test(t)?(Ye(t),this.#p(t,[...t])):this.#p(t,t)}testUnchecked(t){return this.#p(this.#w?t.normalize(this.#w):t)}#p(t,e){if(this.#r!==void 0)return this.#d?(this.#u??=Je(this.#r)).test(t):t===this.#r;let s=this.#m,i=this.#l;if(e===void 0){let c=t.length,f=c+1>>1;if(c<s||f>i)return  false;(f<s||c>i)&&(e=Nt(t));}if(e!==void 0&&(e.length<s||e.length>i))return  false;let n=this.#a.length;if(this.#y)if(this.#b!==void 0&&this.#E!==void 0){if(!t.startsWith(this.#b)||!t.endsWith(this.#E))return  false}else {e??=Nt(t);let c=e.length-this.#s.length;if(!Ve(this.#a,e,0)||!Ve(this.#s,e,c))return  false}let o=!this.options.dot&&t.startsWith(".");if(this.#f){if(t==="."||t===".."||o&&!n)return  false;if(this.#h)return  true;e??=Nt(t);let c=e.length-this.#s.length;return gi(this.#f,e,n,c)}if(e??=Nt(t),t==="."||t===".."){this.#i??=Xe(this.#n);let c=this.#o??=new dt(true,false,this.#i),f=c.state();c.add(f,this.#t,0,true);let u=c.done(f);for(let p=0;p<e.length;p++)u=c.step(u,e[p],p,true);return u.match}this.#i??=Xe(this.#n);let h=this.#g??=new me(this.#t,this.#i),a=h.start(o),l=e===t;for(let c=0;c<e.length;c++){if(a.dead)return  false;let f=l?t.charCodeAt(c):e[c].charCodeAt(0);a=a.ascii?.[f]??h.next(a,e[c]);}return a.match}toString(){return di(this.#t)}};var mt=r=>{if(typeof r!="string")throw new TypeError("invalid pattern");if(r.length>65536)throw new TypeError("pattern is too long")};var K=(r,{windowsPathsNoEscape:t=false,magicalBraces:e=false}={})=>e?t?r.replace(/[?*()[\]{}]/g,"[$&]"):r.replace(/[?*()[\]\\{}]/g,"\\$&"):t?r.replace(/[?*()[\]]/g,"[$&]"):r.replace(/[?*()[\]\\]/g,"\\$&");var st=(r,{windowsPathsNoEscape:t=false,magicalBraces:e=true}={})=>e?t?r.replace(/\[([^/\\])\]/g,"$1"):r.replace(/((?!\\).|^)\[([^/\\])\]/g,"$1$2").replace(/\\([^/])/g,"$1"):t?r.replace(/\[([^/\\{}])\]/g,"$1"):r.replace(/((?!\\).|^)\[([^/\\{}])\]/g,"$1$2").replace(/\\([^/{}])/g,"$1");var T=(r,t,e={})=>(mt(t),!e.nocomment&&t.charAt(0)==="#"?false:xi(t,e).match(r)),it=new Map,Si=256,xi=(r,t)=>{let e=r+"\0"+JSON.stringify(t),s=it.get(e);return s?it.delete(e):(s=new D(r,{...t}),it.size>=Si&&it.delete(it.keys().next().value)),it.set(e,s),s},ls=typeof process=="object"&&process?process.env?.__MINIMATCH_TESTING_PLATFORM__||process.platform:"posix",ns={win32:{sep:"\\"},posix:{sep:"/"}},vi=ls==="win32"?ns.win32.sep:ns.posix.sep;T.sep=vi;var v=Symbol("globstar **");T.GLOBSTAR=v;var Ei=(r,t={})=>e=>T(e,r,t);T.filter=Ei;var U=(r,t={})=>Object.assign({},r,t),ki=r=>{if(!r||typeof r!="object"||!Object.keys(r).length)return T;let t=T;return Object.assign((s,i,n={})=>t(s,i,U(r,n)),{Minimatch:class extends t.Minimatch{constructor(i,n={}){super(i,U(r,n));}static defaults(i){return t.defaults(U(r,i)).Minimatch}},unescape:(s,i={})=>t.unescape(s,U(r,i)),escape:(s,i={})=>t.escape(s,U(r,i)),filter:(s,i={})=>t.filter(s,U(r,i)),defaults:s=>t.defaults(U(r,s)),braceExpand:(s,i={})=>t.braceExpand(s,U(r,i)),match:(s,i,n={})=>t.match(s,i,U(r,n)),sep:t.sep,GLOBSTAR:v})};T.defaults=ki;var xe=(r,t={})=>(mt(r),t.nobrace||!/\{(?:(?!\{).)*\}/.test(r)?[r]:Ge(r,{max:t.braceExpandMax}));T.braceExpand=xe;var Ci=100,Ai=/(?<![\\$])\{(-?\d+)\.\.(-?\d+)\}/g,Mi=(r,t,e={})=>{let s=new D(t,e);return r=r.filter(i=>s.match(i)),s.options.nonull&&!r.length&&r.push(t),r};T.match=Mi;var rs=/[?*]|[+@!]\(.*?\)|\[|\]/,cs=(r,t)=>{let e=t+1;(r.charAt(e)==="!"||r.charAt(e)==="^")&&e++;let s=false;for(;e<r.length;e++){let i=r.charAt(e);if(i==="]"&&s)return e;s=true,i==="\\"&&e++;}return  -1},Ri=(r,t)=>{if(!t&&(r==="+()"||r==="@()"))return r;let e="";for(let s=0;s<r.length;s++){let i=r.charAt(s);if(i==="\\")e+=r.charAt(++s)||i;else {if(i==="*"||i==="?")return;if(i==="["){let n=cs(r,s);if(n===-1){e+=i;continue}let o=r.slice(s+1,n);if(o.startsWith("\\")&&(o=o.slice(1)),[...o].length!==1||"!^".includes(r.charAt(s+1)))return;e+=o,s=n;}else {if(!t&&"+@!".includes(i)&&r.charAt(s+1)==="("&&r.includes(")",s+2))return;e+=i;}}}return e},Oi=r=>{if(/^[?*+@]\(\)$/.test(r)||r.includes("[:"))return  false;let t=0;for(let e=0;e<r.length;e++){let s=r.charAt(e);if(s==="\\"){if(++e===r.length)return  false}else if(s==="["){let i=cs(r,e);i!==-1&&(e=i);}else if("+@!?*".includes(s)&&r.charAt(e+1)==="(")t++,e++;else if(s===")"){if(!t--)return  false}else if(s==="|"&&!t)return  false}return !t},we,os,X=(r,t)=>typeof r=="string"?t===r:t!==""&&r.testUnchecked(t),hs=(r,t,e,s,i)=>X(r,t)?e:s!==void 0&&X(r,s)?i:-1,ve=r=>r==="."||r==="..",be=r=>typeof r=="string"&&/^[a-z]:$/i.test(r),zt=r=>typeof r=="string"&&/^unc$/i.test(r),ye=r=>{if(r[0]!==""||r[1]!=="")return  -1;let t=r[2]!=="?"?2:zt(r[3])?4:-1,e=r[t],s=r[t+1];return t!==-1&&e!==void 0&&e!==""&&e!==v&&s!==void 0&&s!==""&&s!==v?t:-1},Pt=(r,t)=>!ve(r)&&(t||!r.startsWith(".")),gt=(r,t,e,s,i)=>{for(let n=t;n<e;){if(r.charCodeAt(n)===46){if(!s)return  true;let h=r.charCodeAt(n+1)===46?n+2:n+1;if(h>=e||Lt(r.charCodeAt(h),i))return  true}let o=Ee(r,n,i);if(o===-1)return  false;for(n=o+1;n<e&&Lt(r.charCodeAt(n),i);)n++;}return  false},Lt=(r,t)=>t==="/"?r===47:t==="\\"?r===92:r===47||r===92,Ee=(r,t,e)=>{if(e!=="both")return r.indexOf(e,t);let s=r.indexOf("/",t),i=r.indexOf("\\",t);return s===-1?i:i===-1?s:Math.min(s,i)},as=(r,t,e)=>e!=="both"?r.lastIndexOf(e,t):Math.max(r.lastIndexOf("/",t),r.lastIndexOf("\\",t)),Se={},D=class{options;set;pattern;windowsPathsNoEscape;nonegate;negate;comment;empty;preserveMultipleSlashes;partial;globSet;globParts;nocase;isWindows;platform;windowsNoMagicRoot;maxGlobstarRecursion;#t;#n;#i;#o;#r=[];#d=[];#u=[];#f=new Map;#h=false;#m;#l=new WeakMap;constructor(t,e={}){mt(t),e=e||{},this.options=e,this.maxGlobstarRecursion=e.maxGlobstarRecursion??200,this.pattern=t,this.platform=e.platform||ls,this.isWindows=this.platform==="win32";let s="allowWindowsEscape";this.windowsPathsNoEscape=!!e.windowsPathsNoEscape||e[s]===false,this.windowsPathsNoEscape&&(this.pattern=this.pattern.replace(/\\/g,"/")),this.preserveMultipleSlashes=!!e.preserveMultipleSlashes,this.negate=false,this.nonegate=!!e.nonegate,this.comment=false,this.empty=false,this.partial=!!e.partial,this.nocase=!!this.options.nocase,this.windowsNoMagicRoot=e.windowsNoMagicRoot!==void 0?e.windowsNoMagicRoot:!!(this.isWindows&&this.nocase),this.globSet=[],this.globParts=[],this.set=[],this.#t=!this.preserveMultipleSlashes,this.#i=(e.optimizationLevel??1)>=2;let i=e.normalize;this.#o=i===true?"NFC":i||void 0,this.make();let n=this.set.map(o=>this.#s(o));this.#u=this.set.map((o,h)=>this.#t&&o.length-1>n[h]),this.#r=this.set.map((o,h)=>{let a=this.#u[h]?o.length-1:o.length,l=o.slice(n[h]+1,a).filter(c=>typeof c=="string"&&!!c);return [...new Set(l)]}),this.#n=this.#r.some(o=>o.length),this.#d=this.set.map((o,h)=>{let[a,l,c]=o;if(this.#u[h]&&o.length===2&&a===v&&l!==v)return "tail";if(this.#u[h]&&e.matchBase&&o.length===1&&a!==v&&a!=="")return "base";if(!(!this.#t||n[h]!==-1)){if(o.length===3&&a===v&&c===v&&l!==v&&l!==""&&this.maxGlobstarRecursion>0)return "mid";if(o.length===2&&l===v&&a!==v&&a!=="")return "head"}});}#a(t){return this.#o?t.normalize(this.#o):t}#s(t){if(!this.isWindows)return  -1;if(be(t[0]))return 0;if(t[0]===""&&t[1]===""&&t[2]==="?"&&be(t[3]))return 3;let s=ye(t);return s===-1?-1:s+1}hasMagic(){if(this.options.magicalBraces&&this.set.length>1)return  true;for(let t of this.set)for(let e of t)if(typeof e!="string")return  true;return  false}make(){let t=this.pattern,e=this.options;if(!e.nocomment&&t.charAt(0)==="#"){this.comment=true;return}if(!t){this.empty=true;return}this.parseNegate(),this.globSet=[...new Set(this.#M())];let s=this.globSet.map(n=>this.#e(n));this.globParts=this.preprocess(s),this.#h=true;let i=this.globParts.map((n,o,h)=>{if(this.isWindows&&this.windowsNoMagicRoot){let a=n[2]==="?"&&zt(n[3])?6:4,l=n[0]===""&&n[1]===""&&(n[2]==="?"||!rs.test(n[2]))&&n.slice(3,a).every(f=>!rs.test(f)),c=/^[a-z]:/i.test(n[0]);if(l)return [...n.slice(0,a).map(f=>this.#a(f)),...n.slice(a).map(f=>this.parse(f))];if(c)return [this.#a(n[0]),...n.slice(1).map(f=>this.parse(f))]}return n.map(a=>this.parse(a))});if(this.set=i.filter(n=>n.indexOf(false)===-1),this.isWindows)for(let n=0;n<this.set.length;n++){let o=this.set[n];o[0]===""&&o[1]===""&&this.globParts[n][2]==="?"&&(be(o[3])||zt(this.globParts[n][3]))&&(zt(this.globParts[n][3])&&(o[3]="UNC"),o[2]="?");}e.noext||this.mergeRows(),this.#h=false,this.set.forEach((n,o)=>{for(let h=0;h<n.length;h++)n[h]===Se&&(n[h]=this.parse(this.globParts[o][h]));});}mergeRows(){let t=true;for(;t;){t=false;let e=Math.max(0,...this.set.map(s=>s.length));for(let s=0;s<e;s++){let i=new Map;this.set.forEach((o,h)=>{if(!(o[s]instanceof pt||o[s]===Se)||!Oi(this.globParts[h][s]))return;let a=[...this.globParts[h]];a[s]="";let l=`${o.length}/${a.join("/")}`,c=i.get(l);c?c.push(h):i.set(l,[h]);});let n=new Set;for(let o of i.values()){if(o.length<2)continue;let[h,...a]=o,c=`@(${o.map(f=>this.globParts[f][s]).join("|")})`;this.globParts[h][s]=c,this.set[h][s]=this.parse(c);for(let f of a)n.add(f);}n.size&&(t=true,this.set=this.set.filter((o,h)=>!n.has(h)),this.globParts=this.globParts.filter((o,h)=>!n.has(h)));}}}preprocess(t){if(this.options.noglobstar)for(let s of t)for(let i=0;i<s.length;i++)s[i]==="**"&&(s[i]="*");let{optimizationLevel:e=1}=this.options;return e>=2?(t=this.firstPhasePreProcess(t),t=this.secondPhasePreProcess(t)):e>=1?t=this.levelOneOptimize(t):t=this.adjascentGlobstarOptimize(t),t}adjascentGlobstarOptimize(t){return t.map(e=>{let s=-1;for(;(s=e.indexOf("**",s+1))!==-1;){let i=s;for(;e[i+1]==="**";)i++;i!==s&&e.splice(s,i-s);}return e})}levelOneOptimize(t){return t.map(e=>{let s=this.#s(e)+1;return e=e.reduce((i,n)=>{let o=i[i.length-1];return n==="**"&&o==="**"?i:n===".."&&i.length>s&&o&&o!==".."&&o!=="."&&o!=="**"?(i.pop(),i):(i.push(n),i)},[]),e.length===0?[""]:e})}#b(t){let e=!this.isWindows||!t.includes("\\")?"/":t.includes("/")?"both":"\\",s=this.#t?0:-1,i="",n=0,o,h=0,a=!!this.options.dot;t:for(let l=0;l<this.set.length;l++){let c=this.set[l],f=c[c.length-1],u=s!==-1&&this.#u[l]&&f!==v;if(u&&s===0){let d=as(t,t.length,e);if(n=d+1,i=t.slice(n),i===""&&d>=0){let m=d;for(;m>0&&Lt(t.charCodeAt(m-1),e);)m--;h=m===0?0:as(t,m-1,e)+1,o=t.slice(h,m);}let w=this.#i&&(ve(i)||i===""&&o!==void 0&&ve(o));s=w?-1:1,u=!w;}let p=-1;if(u&&typeof f=="string"&&(p=hs(f,i,n,o,h),p===-1))continue;if(this.#n){for(let d of this.#r[l])if(!t.includes(d))continue t}if(u&&typeof f=="object"&&(p=hs(f,i,n,o,h),p===-1))continue;let g=this.#d[l];if(g==="base"&&u)return "yes";if(g==="tail"&&u){if(this.#i&&gt(t,0,p,true,e))return "maybe";if(!gt(t,0,p,a,e))return "yes";continue}if(g==="mid"||g==="head"){let d=this.#y(t,c,g==="head",a,e);if(d!=="no")return d;continue}return "maybe"}return "no"}#E(t,e,s){let i=!!this.options.dot,n=t.length;if(s==="head"){if(n<2||!X(e[0],t[0]))return  false;for(let h=1;h<n;h++)if(!Pt(t[h],i))return  false;return  true}let o=e[1];if(s==="tail"){let h=n-1;if(!X(o,t[h])&&(t[h]!==""||n===1||!X(o,t[--h])))return  false;for(let a=0;a<h;a++)if(!Pt(t[a],i))return  false;return  true}for(let h=0;h<n;h++){if(X(o,t[h])&&h+1<n){let a=h+1;for(;a<n&&Pt(t[a],i);)a++;if(a===n)return  true}if(!Pt(t[h],i))return  false}return  false}#y(t,e,s,i,n){if(this.#i&&gt(t,0,t.length,true,n))return "maybe";let o=e[s?0:1],h=0;for(let a=Ee(t,h,n);a!==-1;a=Ee(t,h,n)){let l=a+1;for(;l<t.length&&Lt(t.charCodeAt(l),n);)l++;if((typeof o=="string"?a-h===o.length&&t.startsWith(o,h):a>h&&o.testUnchecked(t.slice(h,a)))&&!gt(t,l,t.length,i,n))return "yes";if(s||gt(t,h,l,i,n))return "no";h=l;}return "no"}#g(t){let e=we;return e?.f===t&&e.isWindows===this.isWindows&&e.preserveMultipleSlashes===this.preserveMultipleSlashes&&e.normalize===this.#o?e:void 0}#w(t){let{isWindows:e,preserveMultipleSlashes:s}=this,i=this.#e(e?t.split("\\").join("/"):t),n=this.#o;return n&&(i=i.map(o=>o.normalize(n))),we={f:t,isWindows:e,preserveMultipleSlashes:s,normalize:n,parts:i},we}#p(t){let e=[...t],s=false;do{if(s=false,!this.preserveMultipleSlashes){for(let o=1;o<e.length-1;o++){let h=e[o];o===1&&h===""&&e[0]===""||(h==="."||h==="")&&(s=true,e.splice(o,1),o--);}e[0]==="."&&e.length===2&&(e[1]==="."||e[1]==="")&&(s=true,e.pop());}let i=this.#s(e)+1,n=i;for(;(n=e.indexOf("..",n+1))!==-1;){let o=e[n-1];o&&o!=="."&&o!==".."&&o!=="**"&&(s=true,e.splice(n-1,2),n=Math.max(n-2,i));}}while(s);return e.length===0?[""]:e}firstPhasePreProcess(t){let{braceExpandMax:e=1e5}=this.options,s=0,i=1e6,n=false;do{n=false;for(let o of t){let h=-1;for(;(h=o.indexOf("**",h+1))!==-1;){let c=h;for(;o[c+1]==="**";)c++;c>h&&o.splice(h+1,c-h);let f=o[h+1],u=o[h+2],p=o[h+3];if(f!==".."||!u||u==="."||u===".."||!p||p==="."||p==="..")continue;let g=o.length-1;if(t.length>=e||s+g>i)throw new RangeError("optimizationLevel 2: too many patterns from '**/..'");n=true,o.splice(h,1);let d=o.slice(0);d[h]="**",s+=g,t.push(d),h--;}if(!this.preserveMultipleSlashes){for(let c=1;c<o.length-1;c++){let f=o[c];c===1&&f===""&&o[0]===""||(f==="."||f==="")&&(n=true,o.splice(c,1),c--);}o[0]==="."&&o.length===2&&(o[1]==="."||o[1]==="")&&(n=true,o.pop());}let a=this.#s(o)+1,l=a;for(;(l=o.indexOf("..",l+1))!==-1;){let c=o[l-1];if(c&&c!=="."&&c!==".."&&c!=="**"){n=true;let u=l===1&&o[l+1]==="**"?["."]:[];o.splice(l-1,2,...u),o.length===0&&o.push(""),l=Math.max(l-2,a);}}}}while(n);return t}secondPhasePreProcess(t){let e=new Set,s=t.filter(o=>{let h=o.join("/");return e.has(h)?false:(e.add(h),true)}),i=new Map;for(let o of s){let h=[];for(let a=0;a<o.length;a++)o[a]==="*"&&h.push(a);h.length&&i.set(h.join(","),h);}if(!i.size||s.length*i.size>1e5)return s;let{dot:n}=this.options;return s.filter(o=>{for(let h of i.values()){if(h[h.length-1]>=o.length)continue;let a=[...o],l=true,c=false;for(let f of h){let u=o[f];if(u!=="*"){if(!u||u==="**"||!n&&u.startsWith(".")){l=false;break}a[f]="*",c=true;}}if(l&&c&&e.has(a.join("/")))return  false}return  true})}parseNegate(){if(this.nonegate)return;let t=this.pattern,e=false,s=0;for(let i=0;i<t.length&&t.charAt(i)==="!";i++)e=!e,s++;s&&(this.pattern=t.slice(s)),this.negate=e;}#k(t,e,s,i){let n=0,o=0,h=this.isWindows?ye(e):-1,a=h===-1?-1:ye(s);if(a!==-1){let l=s[a],c=s[a+1];typeof l!="string"||typeof c!="string"?(n=h,o=a):e[h].toLowerCase()===l.toLowerCase()&&e[h+1].toLowerCase()===c.toLowerCase()&&(n=h+2,o=a+2);}else if(this.isWindows){let l=typeof t[0]=="string"&&/^[a-z]:$/i.test(t[0]),c=!l&&t[0]===""&&t[1]===""&&t[2]==="?"&&/^[a-z]:$/i.test(t[3]),f=typeof s[0]=="string"&&/^[a-z]:$/i.test(s[0]),u=!f&&s[0]===""&&s[1]===""&&s[2]==="?"&&typeof s[3]=="string"&&/^[a-z]:$/i.test(s[3]),p=c?3:l?0:void 0,g=u?3:f?0:void 0;if(typeof p=="number"&&typeof g=="number"){let[d,w]=[t[p],s[g]];d.toLowerCase()===w.toLowerCase()&&(o=g+1,n=p+1);}}return t=e,s.includes(v)?this.#C(t,s,i,n,o):this.#S(t,s,i,n,o)}#C(t,e,s,i,n){let{head:o,body:h,tail:a,segments:l}=this.#x(e,s,n);if(o.length){let f=i+o.length;if(!this.#S(t,o,s,i,0,f))return  false;i+=o.length,n+=o.length;}let c=0;if(a.length){if(a.length+i>t.length)return  false;let f=t.length-a.length;if(this.#S(t,a,s,f,0))c=a.length;else {if(t[t.length-1]!==""||i+a.length===t.length||(f--,!this.#S(t,a,s,f,0)))return  false;c=a.length+1;}}if(!h.length){let f=!!c;for(let u=i;u<t.length-c;u++){let p=String(t[u]);if(f=true,p==="."||p===".."||!this.options.dot&&p.startsWith("."))return  false}return s||f}return !!this.#v(t,l,t.length-c,i,0,s,0,!!c,new Set)}#x(t,e,s){let i=this.#l.get(t);i||(i=[],this.#l.set(t,i));let n=s*2+(e?1:0),o=i[n];if(o)return o;let h=t.indexOf(v,s),a=t.lastIndexOf(v),l=t.slice(s,h),c=t.slice(h+1,e?void 0:a),f=e?[]:t.slice(a+1),u=[[[],0]],p=u[0],g=0,d=[0];for(let m of c)m===v?(d.push(g),p=[[],0],u.push(p)):(p[0].push(m),g++);u.forEach((m,b)=>{m[1]=g-d[b];});let w={head:l,body:c,tail:f,segments:u};return i[n]=w,w}#v(t,e,s,i,n,o,h,a,l){let c=e[n];if(!c){if(o)return i>=s||i===s-1&&t[i]==="";for(let g=i;g<s;g++){a=true;let d=t[g];if(d==="."||d===".."||!this.options.dot&&d.startsWith("."))return  false}return a}let[f,u]=c,p=o?s:s-u;for(;i<=p;){let g=n*(t.length+1)+i;if(l.has(g))return  false;if(l.add(g),this.#S(t,f,o,i,0,i+f.length)&&h<this.maxGlobstarRecursion){let m=this.#v(t,e,s,i+f.length,n+1,o,h+1,a,l);if(m!==false)return m}if(i===p)break;let w=t[i];if(w==="."||w===".."||!this.options.dot&&w.startsWith("."))return  false;i++;}return o||null}#S(t,e,s,i,n,o=t.length){let h,a,l,c;for(h=i,a=n,c=Math.min(o,t.length),l=e.length;h<c&&a<l;h++,a++){let f=e[a],u=t[h];if(f===false||f===v||!X(f,u))return  false}if(h===c&&a===l)return  true;if(h===c)return s;if(a===l)return h===c-1&&t[h]==="";throw new Error("wtf?")}braceExpand(){return xe(this.pattern,this.options)}#M(){let{pattern:t}=this;if(this.options.nobrace)return this.braceExpand();let e=57344;for(;t.includes(String.fromCharCode(e));)if(++e>63743)return this.braceExpand();let s=String.fromCharCode(e),i=false,n=t.replace(Ai,(h,a,l)=>{let c=Number(a),f=Number(l);return !Number.isSafeInteger(c)||!Number.isSafeInteger(f)||Math.abs(c-f)+1<Ci?h:(i=true,`${s}${a}..${l}${s}`)});if(!i)return this.braceExpand();let o=xe(n,this.options);for(let h of o)for(let a of h.split("/")){let l=a.indexOf("[");if(l!==-1&&l<a.lastIndexOf(s))return this.braceExpand()}return this.#m=s,o}parse(t){mt(t);let e=this.options;if(t==="**")return v;if(t==="")return "";let{nocase:s,nocaseMagicOnly:i,noext:n=false,dot:o,normalize:h}=e,a=this.#m,l=a&&t.includes(a)?void 0:Ri(t,n);if(l!==void 0&&!(s&&!i&&t.toUpperCase()!==t.toLowerCase()))return this.#a(l);if(this.#h)return Se;let c=this.#f.get(t);return c||(c=new pt(t,{nocase:s,noext:n,dot:o,normalize:h,...a&&{rangeMark:a}}),this.#f.set(t,c)),c}#e(t){return this.preserveMultipleSlashes?t.split("/"):this.isWindows&&/^\/\/[^/]+/.test(t)?["",...t.split(/\/+/)]:t.split(/\/+/)}match(t,e=this.partial){if(this.comment)return  false;if(this.empty)return t==="";if(t==="/"&&e)return  true;let s=this.options,i=this.#g(t);if(!i){if(!e&&!this.#o&&(this.#t||this.#n)&&os!==t){os=t;let l=this.#b(t);if(l==="no")return s.flipNegate?false:this.negate;if(l==="yes")return s.flipNegate?true:!this.negate}i=this.#w(t);}let n=i.parts,o=this.#i?i.resolved??=this.#p(n):n,h=this.set,a=n[n.length-1];if(!a)for(let l=n.length-2;!a&&l>=0;l--)a=n[l];for(let l=0;l<h.length;l++){let c=h[l],f=e?void 0:this.#d[l];if(f==="base"?X(c[0],a):f?this.#E(o,c,f):s.matchBase&&c.length===1?this.#k([a],[a],c,e):this.#k(n,o,c,e))return s.flipNegate?true:!this.negate}return s.flipNegate?false:this.negate}static defaults(t){return T.defaults(t).Minimatch}};T.Minimatch=D;T.escape=K;T.unescape=st;var M=channel("lru-cache:metrics"),wt=tracingChannel("lru-cache"),_i=typeof performance=="object"&&performance&&typeof performance.now=="function"?performance:Date,ke=()=>M.hasSubscribers||wt.hasSubscribers,us=new Set,fs=typeof process=="object"&&process?process:{},Di=(r,t,e,s)=>{typeof fs.emitWarning=="function"?fs.emitWarning(r,t,e,s):console.error(`[${e}] ${t}: ${r}`);},Ni=r=>!us.has(r),V=r=>!!r&&r===Math.floor(r)&&r>0&&isFinite(r),ds=r=>V(r)?r<=Math.pow(2,8)?Uint8Array:r<=Math.pow(2,16)?Uint16Array:r<=Math.pow(2,32)?Uint32Array:r<=Number.MAX_SAFE_INTEGER?jt:null:null,jt=class extends Array{constructor(r){super(r),this.fill(0);}},Pi=class bt{heap;length;static#t=false;static create(t){let e=ds(t);if(!e)return [];bt.#t=true;let s=new bt(t,e);return bt.#t=false,s}constructor(t,e){if(!bt.#t)throw new TypeError("instantiate Stack using Stack.create(n)");this.heap=new e(t),this.length=0;}push(t){this.heap[this.length++]=t;}pop(){return this.heap[--this.length]}},yt=class ps{#t;#n;#i;#o;#r;#d;#u;#f;get perf(){return this.#f}ttl;ttlResolution;ttlAutopurge;updateAgeOnGet;updateAgeOnHas;allowStale;noDisposeOnSet;noUpdateTTL;maxEntrySize;sizeCalculation;noDeleteOnFetchRejection;noDeleteOnStaleGet;allowStaleOnFetchAbort;allowStaleOnFetchRejection;ignoreFetchAbort;backgroundFetchSize;#h;#m;#l;#a;#s;#b;#E;#y;#g;#w;#p;#k;#C;#x;#v;#S;#M;#e;#T;static unsafeExposeInternals(t){return {starts:t.#C,ttls:t.#x,autopurgeTimers:t.#v,sizes:t.#k,keyMap:t.#l,keyList:t.#a,valList:t.#s,next:t.#b,prev:t.#E,get head(){return t.#y},get tail(){return t.#g},free:t.#w,isBackgroundFetch:e=>t.#c(e),backgroundFetch:(e,s,i,n)=>t.#L(e,s,i,n),moveToTail:e=>t.#X(e),indexes:e=>t.#O(e),rindexes:e=>t.#F(e),isStale:e=>t.#A(e)}}get max(){return this.#t}get maxSize(){return this.#n}get calculatedSize(){return this.#m}get size(){return this.#h}get fetchMethod(){return this.#d}get memoMethod(){return this.#u}get dispose(){return this.#i}get onInsert(){return this.#o}get disposeAfter(){return this.#r}constructor(t){let{max:e=0,ttl:s,ttlResolution:i=1,ttlAutopurge:n,updateAgeOnGet:o,updateAgeOnHas:h,allowStale:a,dispose:l,onInsert:c,disposeAfter:f,noDisposeOnSet:u,noUpdateTTL:p,maxSize:g=0,maxEntrySize:d=0,sizeCalculation:w,fetchMethod:m,memoMethod:b,noDeleteOnFetchRejection:x,noDeleteOnStaleGet:S,allowStaleOnFetchRejection:y,allowStaleOnFetchAbort:q,ignoreFetchAbort:W,backgroundFetchSize:B=1,perf:et}=t;if(this.backgroundFetchSize=B,et!==void 0&&typeof et?.now!="function")throw new TypeError("perf option must have a now() method if specified");if(this.#f=et??_i,e!==0&&!V(e))throw new TypeError("max option must be a nonnegative integer");let ie=e?ds(e):Array;if(!ie)throw new Error("invalid max value: "+e);if(this.#t=e,this.#n=g,this.maxEntrySize=d||this.#n,this.sizeCalculation=w,this.sizeCalculation){if(!this.#n&&!this.maxEntrySize)throw new TypeError("cannot set sizeCalculation without setting maxSize or maxEntrySize");if(typeof this.sizeCalculation!="function")throw new TypeError("sizeCalculation set to non-function")}if(b!==void 0&&typeof b!="function")throw new TypeError("memoMethod must be a function if defined");if(this.#u=b,m!==void 0&&typeof m!="function")throw new TypeError("fetchMethod must be a function if specified");if(this.#d=m,this.#M=!!m,this.#l=new Map,this.#a=Array.from({length:e}).fill(void 0),this.#s=Array.from({length:e}).fill(void 0),this.#b=new ie(e),this.#E=new ie(e),this.#y=0,this.#g=0,this.#w=Pi.create(e),this.#h=0,this.#m=0,typeof l=="function"&&(this.#i=l),typeof c=="function"&&(this.#o=c),typeof f=="function"?(this.#r=f,this.#p=[]):(this.#r=void 0,this.#p=void 0),this.#S=!!this.#i,this.#T=!!this.#o,this.#e=!!this.#r,this.noDisposeOnSet=!!u,this.noUpdateTTL=!!p,this.noDeleteOnFetchRejection=!!x,this.allowStaleOnFetchRejection=!!y,this.allowStaleOnFetchAbort=!!q,this.ignoreFetchAbort=!!W,this.maxEntrySize!==0){if(this.#n!==0&&!V(this.#n))throw new TypeError("maxSize must be a positive integer if specified");if(!V(this.maxEntrySize))throw new TypeError("maxEntrySize must be a positive integer if specified");this.#G();}if(this.allowStale=!!a,this.noDeleteOnStaleGet=!!S,this.updateAgeOnGet=!!o,this.updateAgeOnHas=!!h,this.ttlResolution=V(i)||i===0?i:1,this.ttlAutopurge=!!n,this.ttl=s||0,this.ttl){if(!V(this.ttl))throw new TypeError("ttl must be a positive integer if specified");this.#_();}if(this.#t===0&&this.ttl===0&&this.#n===0)throw new TypeError("At least one of max, maxSize, or ttl is required");if(!this.ttlAutopurge&&!this.#t&&!this.#n){let ne="LRU_CACHE_UNBOUNDED";Ni(ne)&&(us.add(ne),Di("TTL caching without ttlAutopurge, max, or maxSize can result in unbounded memory consumption.","UnboundedCacheWarning",ne,ps));}}getRemainingTTL(t){return this.#l.has(t)?1/0:0}#_(){let t=new jt(this.#t),e=new jt(this.#t);this.#x=t,this.#C=e;let s=this.ttlAutopurge?Array.from({length:this.#t}):void 0;this.#v=s,this.#W=(a,l,c=this.#f.now())=>{e[a]=l!==0?c:0,t[a]=l,i(a,l);},this.#R=a=>{e[a]=t[a]!==0?this.#f.now():0,i(a,t[a]);};let i=this.ttlAutopurge?(a,l)=>{if(s?.[a]&&(clearTimeout(s[a]),s[a]=void 0),l&&l!==0&&s){let c=setTimeout(()=>{this.#A(a)?(this.#j(this.#a[a],"expire"),s[a]=void 0):i(a,h(a));},l+1);c.unref&&c.unref(),s[a]=c;}}:()=>{};this.#D=(a,l)=>{if(t[l]){let c=t[l],f=e[l];if(!c||!f)return;a.ttl=c,a.start=f,a.now=n||o();let u=a.now-f;a.remainingTTL=c-u;}};let n=0,o=()=>{let a=this.#f.now();if(this.ttlResolution>0){n=a;let l=setTimeout(()=>n=0,this.ttlResolution);l.unref&&l.unref();}return a};this.getRemainingTTL=a=>{let l=this.#l.get(a);return l===void 0?0:h(l)};let h=a=>{let l=t[a],c=e[a];if(!l||!c)return 1/0;let f=(n||o())-c;return l-f};this.#A=a=>{let l=e[a],c=t[a];return !!c&&!!l&&(n||o())-l>c};}#R=()=>{};#D=()=>{};#W=()=>{};#A=()=>false;#G(){let t=new jt(this.#t);this.#m=0,this.#k=t,this.#P=e=>{this.#m-=t[e],t[e]=0;},this.#$=(e,s,i,n)=>{if(!V(i)){if(this.#c(s))return this.backgroundFetchSize;if(n){if(typeof n!="function")throw new TypeError("sizeCalculation must be a function");if(i=n(s,e),!V(i))throw new TypeError("sizeCalculation return invalid (expect positive integer)")}else throw new TypeError("invalid size value (must be positive integer). When maxSize or maxEntrySize is used, sizeCalculation or size must be set.")}return i},this.#N=(e,s,i)=>{if(t[e]=s,this.#n){let n=this.#n-t[e];for(;this.#m>n;)this.#U(true);}this.#m+=t[e],i&&(i.entrySize=s,i.totalCalculatedSize=this.#m);};}#P=t=>{};#N=(t,e,s)=>{};#$=(t,e,s,i)=>{if(s||i)throw new TypeError("cannot set size without setting maxSize or maxEntrySize on cache");return 0};*#O({allowStale:t=this.allowStale}={}){if(this.#h)for(let e=this.#g;this.#I(e)&&((t||!this.#A(e))&&(yield e),e!==this.#y);)e=this.#E[e];}*#F({allowStale:t=this.allowStale}={}){if(this.#h)for(let e=this.#y;this.#I(e)&&((t||!this.#A(e))&&(yield e),e!==this.#g);)e=this.#b[e];}#I(t){return t!==void 0&&this.#l.get(this.#a[t])===t}*entries(){for(let t of this.#O())this.#s[t]!==void 0&&this.#a[t]!==void 0&&!this.#c(this.#s[t])&&(yield [this.#a[t],this.#s[t]]);}*rentries(){for(let t of this.#F())this.#s[t]!==void 0&&this.#a[t]!==void 0&&!this.#c(this.#s[t])&&(yield [this.#a[t],this.#s[t]]);}*keys(){for(let t of this.#O()){let e=this.#a[t];e!==void 0&&!this.#c(this.#s[t])&&(yield e);}}*rkeys(){for(let t of this.#F()){let e=this.#a[t];e!==void 0&&!this.#c(this.#s[t])&&(yield e);}}*values(){for(let t of this.#O())this.#s[t]!==void 0&&!this.#c(this.#s[t])&&(yield this.#s[t]);}*rvalues(){for(let t of this.#F())this.#s[t]!==void 0&&!this.#c(this.#s[t])&&(yield this.#s[t]);}[Symbol.iterator](){return this.entries()}[Symbol.toStringTag]="LRUCache";find(t,e={}){for(let s of this.#O()){let i=this.#s[s],n=this.#c(i)?i.__staleWhileFetching:i;if(n!==void 0&&t(n,this.#a[s],this))return this.#K(this.#a[s],e)}}forEach(t,e=this){for(let s of this.#O()){let i=this.#s[s],n=this.#c(i)?i.__staleWhileFetching:i;n!==void 0&&t.call(e,n,this.#a[s],this);}}rforEach(t,e=this){for(let s of this.#F()){let i=this.#s[s],n=this.#c(i)?i.__staleWhileFetching:i;n!==void 0&&t.call(e,n,this.#a[s],this);}}purgeStale(){let t=false;for(let e of this.#F({allowStale:true}))this.#A(e)&&(this.#j(this.#a[e],"expire"),t=true);return t}info(t){let e=this.#l.get(t);if(e===void 0)return;let s=this.#s[e],i=this.#c(s)?s.__staleWhileFetching:s;if(i===void 0)return;let n={value:i};if(this.#x&&this.#C){let o=this.#x[e],h=this.#C[e];if(o&&h){let a=o-(this.#f.now()-h);n.ttl=a,n.start=Date.now();}}return this.#k&&(n.size=this.#k[e]),n}dump(){let t=[];for(let e of this.#O({allowStale:true})){let s=this.#a[e],i=this.#s[e],n=this.#c(i)?i.__staleWhileFetching:i;if(n===void 0||s===void 0)continue;let o={value:n};if(this.#x&&this.#C){o.ttl=this.#x[e];let h=this.#f.now()-this.#C[e];o.start=Math.floor(Date.now()-h);}this.#k&&(o.size=this.#k[e]),t.unshift([s,o]);}return t}load(t){this.clear();for(let[e,s]of t){if(s.start){let i=Date.now()-s.start;s.start=this.#f.now()-i;}this.#z(e,s.value,s);}}set(t,e,s={}){let{status:i=M.hasSubscribers?{}:void 0}=s;s.status=i,i&&(i.op="set",i.key=t,e!==void 0&&(i.value=e),i.cache=this);let n=this.#z(t,e,s);return i&&M.hasSubscribers&&M.publish(i),n}#z(t,e,s,i){let{ttl:n=this.ttl,start:o,noDisposeOnSet:h=this.noDisposeOnSet,sizeCalculation:a=this.sizeCalculation,status:l}=s,c=this.#c(e);if(e===void 0)return l&&(l.set="deleted"),this.delete(t),this;let{noUpdateTTL:f=this.noUpdateTTL}=s;l&&!c&&(l.value=e);let u=this.#$(t,e,s.size||0,a,l);if(this.maxEntrySize&&u>this.maxEntrySize)return this.#j(t,"set"),l&&(l.set="miss",l.maxEntrySizeExceeded=true),this;let p=this.#h===0?void 0:this.#l.get(t);if(p===void 0)p=this.#h===0?this.#g:this.#w.length!==0?this.#w.pop():this.#h===this.#t?this.#U(false):this.#h,this.#a[p]=t,this.#s[p]=e,this.#l.set(t,p),this.#b[this.#g]=p,this.#E[p]=this.#g,this.#g=p,this.#h++,this.#N(p,u,l),l&&(l.set="add"),f=false,this.#T&&!c&&this.#o?.(e,t,"add");else {this.#X(p);let g=this.#s[p];if(e!==g){if(!h)if(this.#c(g)){g!==i&&g.__abortController.abort(new Error("replaced"));let{__staleWhileFetching:d}=g;d!==void 0&&d!==e&&(this.#S&&this.#i?.(d,t,"set"),this.#e&&this.#p?.push([d,t,"set"]));}else this.#S&&this.#i?.(g,t,"set"),this.#e&&this.#p?.push([g,t,"set"]);if(this.#P(p),this.#N(p,u,l),this.#s[p]=e,!c){let d=g&&this.#c(g)?g.__staleWhileFetching:g,w=d===void 0?"add":e!==d?"replace":"update";l&&(l.set=w,d!==void 0&&(l.oldValue=d)),this.#T&&this.onInsert?.(e,t,w);}}else c||(l&&(l.set="update"),this.#T&&this.onInsert?.(e,t,"update"));}if(n!==0&&!this.#x&&this.#_(),this.#x&&(f||this.#W(p,n,o),l&&this.#D(l,p)),!h&&this.#e&&this.#p){let g=this.#p,d;for(;d=g?.shift();)this.#r?.(...d);}return this}pop(){try{for(;this.#h;){let t=this.#s[this.#y];if(this.#U(!0),this.#c(t)){if(t.__staleWhileFetching)return t.__staleWhileFetching}else if(t!==void 0)return t}}finally{if(this.#e&&this.#p){let t=this.#p,e;for(;e=t?.shift();)this.#r?.(...e);}}}#U(t){let e=this.#y,s=this.#a[e],i=this.#s[e],n=this.#c(i);n&&i.__abortController.abort(new Error("evicted"));let o=n?i.__staleWhileFetching:i;return (this.#S||this.#e)&&o!==void 0&&(this.#S&&this.#i?.(o,s,"evict"),this.#e&&this.#p?.push([o,s,"evict"])),this.#P(e),this.#v?.[e]&&(clearTimeout(this.#v[e]),this.#v[e]=void 0),t&&(this.#a[e]=void 0,this.#s[e]=void 0,this.#w.push(e)),this.#h===1?(this.#y=this.#g=0,this.#w.length=0):this.#y=this.#b[e],this.#l.delete(s),this.#h--,e}has(t,e={}){let{status:s=M.hasSubscribers?{}:void 0}=e;e.status=s,s&&(s.op="has",s.key=t,s.cache=this);let i=this.#V(t,e);return M.hasSubscribers&&M.publish(s),i}#V(t,e={}){let{updateAgeOnHas:s=this.updateAgeOnHas,status:i}=e,n=this.#l.get(t);if(n!==void 0){let o=this.#s[n];if(this.#c(o)&&o.__staleWhileFetching===void 0)return  false;if(this.#A(n))i&&(i.has="stale",this.#D(i,n));else return s&&this.#R(n),i&&(i.has="hit",this.#D(i,n)),true}else i&&(i.has="miss");return  false}peek(t,e={}){let{status:s=ke()?{}:void 0}=e;s&&(s.op="peek",s.key=t,s.cache=this),e.status=s;let i=this.#H(t,e);return M.hasSubscribers&&M.publish(s),i}#H(t,e){let{status:s,allowStale:i=this.allowStale}=e,n=this.#l.get(t);if(n===void 0||!i&&this.#A(n)){s&&(s.peek=n===void 0?"miss":"stale");return}let o=this.#s[n],h=this.#c(o)?o.__staleWhileFetching:o;return s&&(h!==void 0?(s.peek="hit",s.value=h):s.peek="miss"),h}#L(t,e,s,i){let n=e===void 0?void 0:this.#s[e];if(this.#c(n))return n;let o=new AbortController,{signal:h}=s;h?.addEventListener("abort",()=>o.abort(h.reason),{signal:o.signal});let a={signal:o.signal,options:s,context:i},l=(d,w=false)=>{let{aborted:m}=o.signal,b=s.ignoreFetchAbort&&d!==void 0,x=s.ignoreFetchAbort||!!(s.allowStaleOnFetchAbort&&d!==void 0);if(s.status&&(m&&!w?(s.status.fetchAborted=true,s.status.fetchError=o.signal.reason,b&&(s.status.fetchAbortIgnored=true)):s.status.fetchResolved=true),m&&!b&&!w)return f(o.signal.reason,x);let S=p,y=this.#s[e];return (y===p||y===void 0&&b&&w)&&(d===void 0?S.__staleWhileFetching!==void 0?this.#s[e]=S.__staleWhileFetching:this.#j(t,"fetch"):(s.status&&(s.status.fetchUpdated=true),this.#z(t,d,a.options,S))),d},c=d=>(s.status&&(s.status.fetchRejected=true,s.status.fetchError=d),f(d,false)),f=(d,w)=>{let{aborted:m}=o.signal,b=m&&s.allowStaleOnFetchAbort,x=b||s.allowStaleOnFetchRejection,S=x||s.noDeleteOnFetchRejection,y=p;if(this.#s[e]===p&&(!S||!w&&y.__staleWhileFetching===void 0?this.#j(t,"fetch"):b||(this.#s[e]=y.__staleWhileFetching)),x)return s.status&&y.__staleWhileFetching!==void 0&&(s.status.returnedStale=true),y.__staleWhileFetching;if(y.__returned===y)throw d},u=(d,w)=>{let m=this.#d?.(t,n,a);o.signal.addEventListener("abort",()=>{(!s.ignoreFetchAbort||s.allowStaleOnFetchAbort)&&(d(void 0),s.allowStaleOnFetchAbort&&(d=b=>l(b,true)));}),m&&m instanceof Promise?m.then(b=>d(b===void 0?void 0:b),w):m!==void 0&&d(m);};s.status&&(s.status.fetchDispatched=true);let p=new Promise(u).then(l,c),g=Object.assign(p,{__abortController:o,__staleWhileFetching:n,__returned:void 0});return e===void 0?(this.#z(t,g,{...a.options,status:void 0}),e=this.#l.get(t)):this.#s[e]=g,g}#c(t){if(!this.#M)return  false;let e=t;return !!e&&e instanceof Promise&&e.hasOwnProperty("__staleWhileFetching")&&e.__abortController instanceof AbortController}fetch(t,e={}){let s=wt.hasSubscribers,{status:i=ke()?{}:void 0}=e;e.status=i,i&&e.context&&(i.context=e.context);let n=this.#q(t,e);return i&&s&&(i.trace=true,wt.tracePromise(()=>n,i).catch(()=>{})),n}async#q(t,e={}){let{allowStale:s=this.allowStale,updateAgeOnGet:i=this.updateAgeOnGet,noDeleteOnStaleGet:n=this.noDeleteOnStaleGet,ttl:o=this.ttl,noDisposeOnSet:h=this.noDisposeOnSet,size:a=0,sizeCalculation:l=this.sizeCalculation,noUpdateTTL:c=this.noUpdateTTL,noDeleteOnFetchRejection:f=this.noDeleteOnFetchRejection,allowStaleOnFetchRejection:u=this.allowStaleOnFetchRejection,ignoreFetchAbort:p=this.ignoreFetchAbort,allowStaleOnFetchAbort:g=this.allowStaleOnFetchAbort,context:d,forceRefresh:w=false,status:m,signal:b}=e;if(m&&(m.op="fetch",m.key=t,w&&(m.forceRefresh=true),m.cache=this),!this.#M)return m&&(m.fetch="get"),this.#K(t,{allowStale:s,updateAgeOnGet:i,noDeleteOnStaleGet:n,status:m});let x={allowStale:s,updateAgeOnGet:i,noDeleteOnStaleGet:n,ttl:o,noDisposeOnSet:h,size:a,sizeCalculation:l,noUpdateTTL:c,noDeleteOnFetchRejection:f,allowStaleOnFetchRejection:u,allowStaleOnFetchAbort:g,ignoreFetchAbort:p,status:m,signal:b},S=this.#l.get(t);if(S===void 0){m&&(m.fetch="miss");let y=this.#L(t,S,x,d);return y.__returned=y}else {let y=this.#s[S];if(this.#c(y)){let et=s&&y.__staleWhileFetching!==void 0;return m&&(m.fetch="inflight",et&&(m.returnedStale=true)),et?y.__staleWhileFetching:y.__returned=y}let q=this.#A(S);if(!w&&!q)return m&&(m.fetch="hit"),this.#X(S),i&&this.#R(S),m&&this.#D(m,S),y;let W=this.#L(t,S,x,d),B=W.__staleWhileFetching!==void 0&&s;return m&&(m.fetch=q?"stale":"refresh",B&&q&&(m.returnedStale=true)),B?W.__staleWhileFetching:W.__returned=W}}forceFetch(t,e={}){let s=wt.hasSubscribers,{status:i=ke()?{}:void 0}=e;e.status=i,i&&e.context&&(i.context=e.context);let n=this.#B(t,e);return i&&s&&(i.trace=true,wt.tracePromise(()=>n,i).catch(()=>{})),n}async#B(t,e={}){let s=await this.#q(t,e);if(s===void 0)throw new Error("fetch() returned undefined");return s}memo(t,e={}){let{status:s=M.hasSubscribers?{}:void 0}=e;e.status=s,s&&(s.op="memo",s.key=t,e.context&&(s.context=e.context),s.cache=this);let i=this.#Z(t,e);return s&&(s.value=i),M.hasSubscribers&&M.publish(s),i}#Z(t,e={}){let s=this.#u;if(!s)throw new Error("no memoMethod provided to constructor");let{context:i,status:n,forceRefresh:o,...h}=e;n&&o&&(n.forceRefresh=true);let a=this.#K(t,h),l=o||a===void 0;if(n&&(n.memo=l?"miss":"hit",l||(n.value=a)),!l)return a;let c=s(t,a,{options:h,context:i});return n&&(n.value=c),this.#z(t,c,h),c}get(t,e={}){let{status:s=M.hasSubscribers?{}:void 0}=e;e.status=s,s&&(s.op="get",s.key=t,s.cache=this);let i=this.#K(t,e);return s&&(i!==void 0&&(s.value=i),M.hasSubscribers&&M.publish(s)),i}#K(t,e={}){let{allowStale:s=this.allowStale,updateAgeOnGet:i=this.updateAgeOnGet,noDeleteOnStaleGet:n=this.noDeleteOnStaleGet,status:o}=e,h=this.#l.get(t);if(h===void 0){o&&(o.get="miss");return}let a=this.#s[h],l=this.#c(a);return o&&this.#D(o,h),this.#A(h)?l?(o&&(o.get="stale-fetching"),s&&a.__staleWhileFetching!==void 0?(o&&(o.returnedStale=true),a.__staleWhileFetching):void 0):(n||this.#j(t,"expire"),o&&(o.get="stale"),s?(o&&(o.returnedStale=true),a):void 0):(o&&(o.get=l?"fetching":"hit"),this.#X(h),i&&this.#R(h),l?a.__staleWhileFetching:a)}#Y(t,e){this.#E[e]=t,this.#b[t]=e;}#X(t){t!==this.#g&&(t===this.#y?this.#y=this.#b[t]:this.#Y(this.#E[t],this.#b[t]),this.#Y(this.#g,t),this.#g=t);}delete(t){return this.#j(t,"delete")}#j(t,e){M.hasSubscribers&&M.publish({op:"delete",delete:e,key:t,cache:this});let s=false;if(this.#h!==0){let i=this.#l.get(t);if(i!==void 0)if(this.#v?.[i]&&(clearTimeout(this.#v[i]),this.#v[i]=void 0),s=true,this.#h===1)this.#J(e);else {this.#P(i);let n=this.#s[i];if(this.#c(n)?n.__abortController.abort(new Error("deleted")):(this.#S||this.#e)&&(this.#S&&this.#i?.(n,t,e),this.#e&&this.#p?.push([n,t,e])),this.#l.delete(t),this.#a[i]=void 0,this.#s[i]=void 0,i===this.#g)this.#g=this.#E[i];else if(i===this.#y)this.#y=this.#b[i];else {let o=this.#E[i];this.#b[o]=this.#b[i];let h=this.#b[i];this.#E[h]=this.#E[i];}this.#h--,this.#w.push(i);}}if(this.#e&&this.#p?.length){let i=this.#p,n;for(;n=i?.shift();)this.#r?.(...n);}return s}clear(){return this.#J("delete")}#J(t){for(let e of this.#F({allowStale:true})){let s=this.#s[e];if(this.#c(s))s.__abortController.abort(new Error("deleted"));else {let i=this.#a[e];this.#S&&this.#i?.(s,i,t),this.#e&&this.#p?.push([s,i,t]);}}if(this.#l.clear(),this.#s.fill(void 0),this.#a.fill(void 0),this.#x&&this.#C){this.#x.fill(0),this.#C.fill(0);for(let e of this.#v??[])e!==void 0&&clearTimeout(e);this.#v?.fill(void 0);}if(this.#k&&this.#k.fill(0),this.#y=0,this.#g=0,this.#w.length=0,this.#m=0,this.#h=0,this.#e&&this.#p){let e=this.#p,s;for(;s=e?.shift();)this.#r?.(...s);}}};var ms$1=typeof process=="object"&&process?process:{stdout:null,stderr:null},Li=r=>!!r&&typeof r=="object"&&(r instanceof J||r instanceof require$$0$3||ji(r)||Wi(r)),ji=r=>!!r&&typeof r=="object"&&r instanceof EventEmitter&&typeof r.pipe=="function"&&r.pipe!==require$$0$3.Writable.prototype.pipe,Wi=r=>!!r&&typeof r=="object"&&r instanceof EventEmitter&&typeof r.write=="function"&&typeof r.end=="function",G$1=Symbol("EOF"),H=Symbol("maybeEmitEnd"),Y=Symbol("emittedEnd"),Wt=Symbol("emittingEnd"),St=Symbol("emittedError"),$t=Symbol("closed"),gs=Symbol("read"),It=Symbol("flush"),ws=Symbol("flushChunk"),z=Symbol("encoding"),nt=Symbol("decoder"),k=Symbol("flowing"),xt=Symbol("paused"),rt=Symbol("resume"),C=Symbol("buffer"),F=Symbol("pipes"),A=Symbol("bufferLength"),Ce=Symbol("bufferPush"),Bt=Symbol("bufferShift"),R=Symbol("objectMode"),E=Symbol("destroyed"),Ae=Symbol("error"),Me=Symbol("emitData"),bs=Symbol("emitEnd"),Re=Symbol("emitEnd2"),$=Symbol("async"),Oe=Symbol("abort"),Ut=Symbol("aborted"),vt=Symbol("signal"),Q=Symbol("dataListeners"),_=Symbol("discarded"),Et=r=>Promise.resolve().then(r),$i=r=>r(),Ii=r=>r==="end"||r==="finish"||r==="prefinish",Bi=r=>r instanceof ArrayBuffer||!!r&&typeof r=="object"&&r.constructor&&r.constructor.name==="ArrayBuffer"&&r.byteLength>=0,Ui=r=>!Buffer.isBuffer(r)&&ArrayBuffer.isView(r),Gt=class{src;dest;opts;ondrain;constructor(t,e,s){this.src=t,this.dest=e,this.opts=s,this.ondrain=()=>t[rt](),this.dest.on("drain",this.ondrain);}unpipe(){this.dest.removeListener("drain",this.ondrain);}proxyErrors(t){}end(){this.unpipe(),this.opts.end&&this.dest.end();}},Fe=class extends Gt{unpipe(){this.src.removeListener("error",this.proxyErrors),super.unpipe();}constructor(t,e,s){super(t,e,s),this.proxyErrors=i=>this.dest.emit("error",i),t.on("error",this.proxyErrors);}},Gi=r=>!!r.objectMode,Hi=r=>!r.objectMode&&!!r.encoding&&r.encoding!=="buffer",J=class extends EventEmitter{[k]=false;[xt]=false;[F]=[];[C]=[];[R];[z];[$];[nt];[G$1]=false;[Y]=false;[Wt]=false;[$t]=false;[St]=null;[A]=0;[E]=false;[vt];[Ut]=false;[Q]=0;[_]=false;writable=true;readable=true;constructor(...t){let e=t[0]||{};if(super(),e.objectMode&&typeof e.encoding=="string")throw new TypeError("Encoding and objectMode may not be used together");Gi(e)?(this[R]=true,this[z]=null):Hi(e)?(this[z]=e.encoding,this[R]=false):(this[R]=false,this[z]=null),this[$]=!!e.async,this[nt]=this[z]?new StringDecoder(this[z]):null,e&&e.debugExposeBuffer===true&&Object.defineProperty(this,"buffer",{get:()=>this[C]}),e&&e.debugExposePipes===true&&Object.defineProperty(this,"pipes",{get:()=>this[F]});let{signal:s}=e;s&&(this[vt]=s,s.aborted?this[Oe]():s.addEventListener("abort",()=>this[Oe]()));}get bufferLength(){return this[A]}get encoding(){return this[z]}set encoding(t){throw new Error("Encoding must be set at instantiation time")}setEncoding(t){throw new Error("Encoding must be set at instantiation time")}get objectMode(){return this[R]}set objectMode(t){throw new Error("objectMode must be set at instantiation time")}get async(){return this[$]}set async(t){this[$]=this[$]||!!t;}[Oe](){this[Ut]=true,this.emit("abort",this[vt]?.reason),this.destroy(this[vt]?.reason);}get aborted(){return this[Ut]}set aborted(t){}write(t,e,s){if(this[Ut])return  false;if(this[G$1])throw new Error("write after end");if(this[E])return this.emit("error",Object.assign(new Error("Cannot call write after a stream was destroyed"),{code:"ERR_STREAM_DESTROYED"})),true;typeof e=="function"&&(s=e,e="utf8"),e||(e="utf8");let i=this[$]?Et:$i;if(!this[R]&&!Buffer.isBuffer(t)){if(Ui(t))t=Buffer.from(t.buffer,t.byteOffset,t.byteLength);else if(Bi(t))t=Buffer.from(t);else if(typeof t!="string")throw new Error("Non-contiguous data written to non-objectMode stream")}return this[R]?(this[k]&&this[A]!==0&&this[It](true),this[k]?this.emit("data",t):this[Ce](t),this[A]!==0&&this.emit("readable"),s&&i(s),this[k]):t.length?(typeof t=="string"&&!(e===this[z]&&!this[nt]?.lastNeed)&&(t=Buffer.from(t,e)),Buffer.isBuffer(t)&&this[z]&&(t=this[nt].write(t)),this[k]&&this[A]!==0&&this[It](true),this[k]?this.emit("data",t):this[Ce](t),this[A]!==0&&this.emit("readable"),s&&i(s),this[k]):(this[A]!==0&&this.emit("readable"),s&&i(s),this[k])}read(t){if(this[E])return null;if(this[_]=false,this[A]===0||t===0||t&&t>this[A])return this[H](),null;this[R]&&(t=null),this[C].length>1&&!this[R]&&(this[C]=[this[z]?this[C].join(""):Buffer.concat(this[C],this[A])]);let e=this[gs](t||null,this[C][0]);return this[H](),e}[gs](t,e){if(this[R])this[Bt]();else {let s=e;t===s.length||t===null?this[Bt]():typeof s=="string"?(this[C][0]=s.slice(t),e=s.slice(0,t),this[A]-=t):(this[C][0]=s.subarray(t),e=s.subarray(0,t),this[A]-=t);}return this.emit("data",e),!this[C].length&&!this[G$1]&&this.emit("drain"),e}end(t,e,s){return typeof t=="function"&&(s=t,t=void 0),typeof e=="function"&&(s=e,e="utf8"),t!==void 0&&this.write(t,e),s&&this.once("end",s),this[G$1]=true,this.writable=false,(this[k]||!this[xt])&&this[H](),this}[rt](){this[E]||(!this[Q]&&!this[F].length&&(this[_]=true),this[xt]=false,this[k]=true,this.emit("resume"),this[C].length?this[It]():this[G$1]?this[H]():this.emit("drain"));}resume(){return this[rt]()}pause(){this[k]=false,this[xt]=true,this[_]=false;}get destroyed(){return this[E]}get flowing(){return this[k]}get paused(){return this[xt]}[Ce](t){this[R]?this[A]+=1:this[A]+=t.length,this[C].push(t);}[Bt](){return this[R]?this[A]-=1:this[A]-=this[C][0].length,this[C].shift()}[It](t=false){do;while(this[ws](this[Bt]())&&this[C].length);!t&&!this[C].length&&!this[G$1]&&this.emit("drain");}[ws](t){return this.emit("data",t),this[k]}pipe(t,e){if(this[E])return t;this[_]=false;let s=this[Y];return e=e||{},t===ms$1.stdout||t===ms$1.stderr?e.end=false:e.end=e.end!==false,e.proxyErrors=!!e.proxyErrors,s?e.end&&t.end():(this[F].push(e.proxyErrors?new Fe(this,t,e):new Gt(this,t,e)),this[$]?Et(()=>this[rt]()):this[rt]()),t}unpipe(t){let e=this[F].find(s=>s.dest===t);e&&(this[F].length===1?(this[k]&&this[Q]===0&&(this[k]=false),this[F]=[]):this[F].splice(this[F].indexOf(e),1),e.unpipe());}addListener(t,e){return this.on(t,e)}on(t,e){let s=super.on(t,e);if(t==="data")this[_]=false,this[Q]++,!this[F].length&&!this[k]&&this[rt]();else if(t==="readable"&&this[A]!==0)super.emit("readable");else if(Ii(t)&&this[Y])super.emit(t),this.removeAllListeners(t);else if(t==="error"&&this[St]){let i=e;this[$]?Et(()=>i.call(this,this[St])):i.call(this,this[St]);}return s}removeListener(t,e){return this.off(t,e)}off(t,e){let s=super.off(t,e);return t==="data"&&(this[Q]=this.listeners("data").length,this[Q]===0&&!this[_]&&!this[F].length&&(this[k]=false)),s}removeAllListeners(t){let e=super.removeAllListeners(t);return (t==="data"||t===void 0)&&(this[Q]=0,!this[_]&&!this[F].length&&(this[k]=false)),e}get emittedEnd(){return this[Y]}[H](){!this[Wt]&&!this[Y]&&!this[E]&&this[C].length===0&&this[G$1]&&(this[Wt]=true,this.emit("end"),this.emit("prefinish"),this.emit("finish"),this[$t]&&this.emit("close"),this[Wt]=false);}emit(t,...e){let s=e[0];if(t!=="error"&&t!=="close"&&t!==E&&this[E])return  false;if(t==="data")return !this[R]&&!s?false:this[$]?(Et(()=>this[Me](s)),true):this[Me](s);if(t==="end")return this[bs]();if(t==="close"){if(this[$t]=true,!this[Y]&&!this[E])return  false;let n=super.emit("close");return this.removeAllListeners("close"),n}else if(t==="error"){this[St]=s,super.emit(Ae,s);let n=!this[vt]||this.listeners("error").length?super.emit("error",s):false;return this[H](),n}else if(t==="resume"){let n=super.emit("resume");return this[H](),n}else if(t==="finish"||t==="prefinish"){let n=super.emit(t);return this.removeAllListeners(t),n}let i=super.emit(t,...e);return this[H](),i}[Me](t){for(let s of this[F])s.dest.write(t)===false&&this.pause();let e=this[_]?false:super.emit("data",t);return this[H](),e}[bs](){return this[Y]?false:(this[Y]=true,this.readable=false,this[$]?(Et(()=>this[Re]()),true):this[Re]())}[Re](){if(this[nt]){let e=this[nt].end();if(e){for(let s of this[F])s.dest.write(e);this[_]||super.emit("data",e);}}for(let e of this[F])e.end();let t=super.emit("end");return this.removeAllListeners("end"),t}async collect(){let t=Object.assign([],{dataLength:0});this[R]||(t.dataLength=0);let e=this.promise();return this.on("data",s=>{t.push(s),this[R]||(t.dataLength+=s.length);}),await e,t}async concat(){if(this[R])throw new Error("cannot concat in objectMode");let t=await this.collect();return this[z]?t.join(""):Buffer.concat(t,t.dataLength)}async promise(){return new Promise((t,e)=>{this.on(E,()=>e(new Error("stream destroyed"))),this.on("error",s=>e(s)),this.on("end",()=>t());})}[Symbol.asyncIterator](){this[_]=false;let t=false,e=async()=>(this.pause(),t=true,{value:void 0,done:true});return {next:()=>{if(t)return e();let i=this.read();if(i!==null)return Promise.resolve({done:false,value:i});if(this[G$1])return e();let n,o,h=f=>{this.off("data",a),this.off("end",l),this.off(E,c),e(),o(f);},a=f=>{this.off("error",h),this.off("end",l),this.off(E,c),this.pause(),n({value:f,done:!!this[G$1]});},l=()=>{this.off("error",h),this.off("data",a),this.off(E,c),e(),n({done:true,value:void 0});},c=()=>h(new Error("stream destroyed"));return new Promise((f,u)=>{o=u,n=f,this.once(E,c),this.once("error",h),this.once("end",l),this.once("data",a);})},throw:e,return:e,[Symbol.asyncIterator](){return this},[Symbol.asyncDispose]:async()=>{}}}[Symbol.iterator](){this[_]=false;let t=false,e=()=>(this.pause(),this.off(Ae,e),this.off(E,e),this.off("end",e),t=true,{done:true,value:void 0}),s=()=>{if(t)return e();let i=this.read();return i===null?e():{done:false,value:i}};return this.once("end",e),this.once(Ae,e),this.once(E,e),{next:s,throw:e,return:e,[Symbol.iterator](){return this},[Symbol.dispose]:()=>{}}}destroy(t){if(this[E])return t?this.emit("error",t):this.emit(E),this;this[E]=true,this[_]=true,this[C].length=0,this[A]=0;let e=this;return typeof e.close=="function"&&!this[$t]&&e.close(),t?this.emit("error",t):this.emit(E),this}static get isStream(){return Li}};var tn=realpathSync.native,Ct={lstatSync:lstatSync,readdir:readdir$2,readdirSync:readdirSync,readlinkSync:readlinkSync,realpathSync:tn,promises:{lstat:lstat$1,readdir:readdir$1,readlink:readlink,realpath:realpath}},Cs=r=>!r||r===Ct||r===Qi?Ct:{...Ct,...r,promises:{...Ct.promises,...r.promises}},on=/^\\\\\?\\([a-z]:)\\?$/i,hn=/^\\\\\?\\UNC\\([^\\]+\\[^\\]+)\\?$/i,an=/^\\\\[^\\?]+\\[^\\]+$/,Ss=r=>r.replace(/\//g,"\\").replace(on,"$1\\").replace(hn,"\\\\$1\\").replace(an,"$&\\"),ln=/^[\\/]{2}\?[\\/]unc[\\/][^\\/]+[\\/][^\\/]+(?:[\\/]|$)/i,cn=/^[\\/]{2}\?[\\/](?=[a-z]:)/i,fn=/^[\\/]{2}\?[\\/]unc(?=[\\/][^\\/]+[\\/][^\\/])/i,un=/[\\/]/,P=0,As=1,Ms=2,I=4,Rs=6,Os=8,tt=10,Fs=12,N=15,kt=~N,_e=16,xs=32,At=64,L=128,Ht=256,Kt=512,vs=At|L|Kt,dn=1023,De=r=>r.isFile()?Os:r.isDirectory()?I:r.isSymbolicLink()?tt:r.isCharacterDevice()?Ms:r.isBlockDevice()?Rs:r.isSocket()?Fs:r.isFIFO()?As:P,Es=new yt({max:2**12}),Mt=r=>{let t=Es.get(r);if(t)return t;let e=r.normalize("NFKD");return Es.set(r,e),e},ks=new yt({max:2**12}),qt=r=>{let t=ks.get(r);if(t)return t;let e=Mt(r.toLowerCase());return ks.set(r,e),e},Xt=class extends yt{constructor(){super({max:256});}},Pe=class extends yt{constructor(t=16*1024){super({maxSize:t,sizeCalculation:e=>e.length+1});}},Ts=Symbol("PathScurry setAsCwd"),O=class{name;root;roots;parent;nocase;isCWD=false;#t;#n;get dev(){return this.#n}#i;get mode(){return this.#i}#o;get nlink(){return this.#o}#r;get uid(){return this.#r}#d;get gid(){return this.#d}#u;get rdev(){return this.#u}#f;get blksize(){return this.#f}#h;get ino(){return this.#h}#m;get size(){return this.#m}#l;get blocks(){return this.#l}#a;get atimeMs(){return this.#a}#s;get mtimeMs(){return this.#s}#b;get ctimeMs(){return this.#b}#E;get birthtimeMs(){return this.#E}#y;get atime(){return this.#y}#g;get mtime(){return this.#g}#w;get ctime(){return this.#w}#p;get birthtime(){return this.#p}#k;#C;#x;#v;#S;#M;#e;#T;#_;#R;get parentPath(){return (this.parent||this).fullpath()}get path(){return this.parentPath}constructor(t,e=P,s,i,n,o,h){this.name=t,this.#k=n?qt(t):Mt(t),this.#e=e&dn,this.nocase=n,this.roots=i,this.root=s||this,this.#T=o,this.#x=h.fullpath,this.#S=h.relative,this.#M=h.relativePosix,this.parent=h.parent,this.parent?this.#t=this.parent.#t:this.#t=Cs(h.fs);}get fs(){return this.#t}depth(){return this.#C!==void 0?this.#C:this.parent?this.#C=this.parent.depth()+1:this.#C=0}childrenCache(){return this.#T}resolve(t){if(!t)return this;let e=this.getRootString(t),i=t.substring(e.length).split(this.splitSep);return e?this.getRoot(e).#D(i):this.#D(i)}#D(t){let e=this;for(let s of t)e=e.child(s);return e}children(){let t=this.#T.get(this);if(t)return t;let e=Object.assign([],{provisional:0});return this.#T.set(this,e),this.#e&=~_e,e}child(t,e){if(t===""||t===".")return this;if(t==="..")return this.parent||this;let s=this.children(),i=this.nocase?qt(t):Mt(t);for(let a of s)if(a.#k===i)return a;let n=this.parent?this.sep:"",o=this.#x?this.#x+n+t:void 0,h=this.newChild(t,P,{...e,parent:this,fullpath:o});return this.canReaddir()||(h.#e|=L),s.push(h),h}relative(){if(this.isCWD)return "";if(this.#S!==void 0)return this.#S;let t=this.name,e=this.parent;if(!e)return this.#S=this.name;let s=e.relative();return s+(!s||!e.parent?"":this.sep)+t}relativePosix(){if(this.sep==="/")return this.relative();if(this.isCWD)return "";if(this.#M!==void 0)return this.#M;let t=this.name,e=this.parent;if(!e)return this.#M=this.fullpathPosix();let s=e.relativePosix();return s+(!s||!e.parent?"":"/")+t}fullpath(){if(this.#x!==void 0)return this.#x;let t=this.name,e=this.parent;if(!e)return this.#x=this.name;let i=e.fullpath()+(e.parent?this.sep:"")+t;return this.#x=i}fullpathPosix(){if(this.#v!==void 0)return this.#v;if(this.sep==="/")return this.#v=this.fullpath();if(!this.parent){let i=this.fullpath().replace(/\\/g,"/");return /^[a-z]:\//i.test(i)?this.#v=`//?/${i}`:this.#v=i}let t=this.parent,e=t.fullpathPosix(),s=e+(!e||!t.parent?"":"/")+this.name;return this.#v=s}isUnknown(){return (this.#e&N)===P}isType(t){return this[`is${t}`]()}getType(){return this.isUnknown()?"Unknown":this.isDirectory()?"Directory":this.isFile()?"File":this.isSymbolicLink()?"SymbolicLink":this.isFIFO()?"FIFO":this.isCharacterDevice()?"CharacterDevice":this.isBlockDevice()?"BlockDevice":this.isSocket()?"Socket":"Unknown"}isFile(){return (this.#e&N)===Os}isDirectory(){return (this.#e&N)===I}isCharacterDevice(){return (this.#e&N)===Ms}isBlockDevice(){return (this.#e&N)===Rs}isFIFO(){return (this.#e&N)===As}isSocket(){return (this.#e&N)===Fs}isSymbolicLink(){return (this.#e&tt)===tt}lstatCached(){return this.#e&xs?this:void 0}readlinkCached(){return this.#_}realpathCached(){return this.#R}readdirCached(){let t=this.children();return t.slice(0,t.provisional)}canReadlink(){if(this.#_)return  true;if(!this.parent)return  false;let t=this.#e&N;return !(t!==P&&t!==tt||this.#e&Ht||this.#e&L)}calledReaddir(){return !!(this.#e&_e)}isENOENT(){return !!(this.#e&L)}isNamed(t){return this.nocase?this.#k===qt(t):this.#k===Mt(t)}async readlink(){let t=this.#_;if(t)return t;if(this.canReadlink()&&this.parent)try{let e=await this.#t.promises.readlink(this.fullpath()),s=(await this.parent.realpath())?.resolve(e);if(s)return this.#_=s}catch(e){this.#F(e.code);return}}readlinkSync(){let t=this.#_;if(t)return t;if(this.canReadlink()&&this.parent)try{let e=this.#t.readlinkSync(this.fullpath()),s=this.parent.realpathSync()?.resolve(e);if(s)return this.#_=s}catch(e){this.#F(e.code);return}}#W(t){this.#e|=_e;for(let e=t.provisional;e<t.length;e++){let s=t[e];s&&s.#A();}}#A(){this.#e&L||(this.#e=(this.#e|L)&kt,this.#G());}#G(){let t=this.children();t.provisional=0;for(let e of t)e.#A();}#P(){this.#e|=Kt,this.#N();}#N(){if(this.#e&At)return;let t=this.#e;(t&N)===I&&(t&=kt),this.#e=t|At,this.#G();}#$(t=""){t==="ENOTDIR"||t==="EPERM"?this.#N():t==="ENOENT"?this.#A():this.children().provisional=0;}#O(t=""){t==="ENOTDIR"?this.parent.#N():t==="ENOENT"&&this.#A();}#F(t=""){let e=this.#e;e|=Ht,t==="ENOENT"&&(e|=L),(t==="EINVAL"||t==="UNKNOWN")&&(e&=kt),this.#e=e,t==="ENOTDIR"&&this.parent&&this.parent.#N();}#I(t,e){return this.#U(t,e)||this.#z(t,e)}#z(t,e){let s=De(t),i=this.newChild(t.name,s,{parent:this}),n=i.#e&N;return n!==I&&n!==tt&&n!==P&&(i.#e|=At),e.unshift(i),e.provisional++,i}#U(t,e){for(let s=e.provisional;s<e.length;s++){let i=e[s];if((this.nocase?qt(t.name):Mt(t.name))===i.#k)return this.#V(t,i,s,e)}}#V(t,e,s,i){let n=e.name;return e.#e=e.#e&kt|De(t),n!==t.name&&(e.name=t.name),s!==i.provisional&&(s===i.length-1?i.pop():i.splice(s,1),i.unshift(e)),i.provisional++,e}async lstat(){if((this.#e&L)===0)try{return this.#H(await this.#t.promises.lstat(this.fullpath())),this}catch(t){this.#O(t.code);}}lstatSync(){if((this.#e&L)===0)try{return this.#H(this.#t.lstatSync(this.fullpath())),this}catch(t){this.#O(t.code);}}#H(t){let{atime:e,atimeMs:s,birthtime:i,birthtimeMs:n,blksize:o,blocks:h,ctime:a,ctimeMs:l,dev:c,gid:f,ino:u,mode:p,mtime:g,mtimeMs:d,nlink:w,rdev:m,size:b,uid:x}=t;this.#y=e,this.#a=s,this.#p=i,this.#E=n,this.#f=o,this.#l=h,this.#w=a,this.#b=l,this.#n=c,this.#d=f,this.#h=u,this.#i=p,this.#g=g,this.#s=d,this.#o=w,this.#u=m,this.#m=b,this.#r=x;let S=De(t);this.#e=this.#e&kt|S|xs,S!==P&&S!==I&&S!==tt&&(this.#e|=At);}#L=[];#c=false;#q(t){this.#c=false;let e=this.#L.slice();this.#L.length=0,e.forEach(s=>s(null,t));}readdirCB(t,e=false){if(!this.canReaddir()){e?t(null,[]):queueMicrotask(()=>t(null,[]));return}let s=this.children();if(this.calledReaddir()){let n=s.slice(0,s.provisional);e?t(null,n):queueMicrotask(()=>t(null,n));return}if(this.#L.push(t),this.#c)return;this.#c=true;let i=this.fullpath();this.#t.readdir(i,{withFileTypes:true},(n,o)=>{if(n)this.#$(n.code),s.provisional=0;else {for(let h of o)this.#I(h,s);this.#W(s);}this.#q(s.slice(0,s.provisional));});}#B;async readdir(){if(!this.canReaddir())return [];let t=this.children();if(this.calledReaddir())return t.slice(0,t.provisional);let e=this.fullpath();if(this.#B)await this.#B;else {let s=()=>{};this.#B=new Promise(i=>s=i);try{for(let i of await this.#t.promises.readdir(e,{withFileTypes:!0}))this.#I(i,t);this.#W(t);}catch(i){this.#$(i.code),t.provisional=0;}this.#B=void 0,s();}return t.slice(0,t.provisional)}readdirSync(){if(!this.canReaddir())return [];let t=this.children();if(this.calledReaddir())return t.slice(0,t.provisional);let e=this.fullpath();try{for(let s of this.#t.readdirSync(e,{withFileTypes:!0}))this.#I(s,t);this.#W(t);}catch(s){this.#$(s.code),t.provisional=0;}return t.slice(0,t.provisional)}canReaddir(){if(this.#e&vs)return  false;let t=N&this.#e;return t===P||t===I||t===tt}shouldWalk(t,e){return (this.#e&I)===I&&!(this.#e&vs)&&!t.has(this)&&(!e||e(this))}async realpath(){if(this.#R)return this.#R;if(!((Kt|Ht|L)&this.#e))try{let t=await this.#t.promises.realpath(this.fullpath());return this.#R=this.resolve(t)}catch{this.#P();}}realpathSync(){if(this.#R)return this.#R;if(!((Kt|Ht|L)&this.#e))try{let t=this.#t.realpathSync(this.fullpath());return this.#R=this.resolve(t)}catch{this.#P();}}[Ts](t){if(t===this)return;t.isCWD=false,this.isCWD=true;let e=new Set([]),s=[],i=this;for(;i&&i.parent;)e.add(i),i.#S=s.join(this.sep),i.#M=s.join("/"),i=i.parent,s.push("..");for(i=t;i&&i.parent&&!e.has(i);)i.#S=void 0,i.#M=void 0,i=i.parent;}},Vt=class r extends O{sep="\\";splitSep=un;constructor(t,e=P,s,i,n,o,h){super(t,e,s,i,n,o,h);}newChild(t,e=P,s={}){return new r(t,e,this.root,this.roots,this.nocase,this.childrenCache(),s)}getRootString(t){return ln.exec(t)?.[0]??win32.parse(t).root}getRoot(t){if(t=Ss(t.toUpperCase()),t===this.root.name||/^[\\/]$/.test(t))return this.root;for(let[e,s]of Object.entries(this.roots))if(this.sameRoot(t,e))return this.roots[t]=s;return this.roots[t]=new ot(t,{nocase:this.nocase,fs:this.fs}).root}sameRoot(t,e=this.root.name){return Ss(t.toUpperCase())===e}},Yt=class r extends O{splitSep="/";sep="/";constructor(t,e=P,s,i,n,o,h){super(t,e,s,i,n,o,h);}getRootString(t){return t.startsWith("/")?"/":""}getRoot(t){return this.root}newChild(t,e=P,s={}){return new r(t,e,this.root,this.roots,this.nocase,this.childrenCache(),s)}},Jt=class{root;rootPath;roots;cwd;#t;#n;#i;nocase;#o;constructor(t=process.cwd(),e,s,{nocase:i,childrenCacheSize:n=16*1024,fs:o=Ct}={}){this.#o=Cs(o),(t instanceof URL||t.startsWith("file://"))&&(t=fileURLToPath(t));let h=e.resolve(t);this.roots=Object.create(null),this.rootPath=this.parseRootPath(h),this.#t=new Xt,this.#n=new Xt,this.#i=new Pe(n);let a=h.substring(this.rootPath.length).split(s);if(a.length===1&&!a[0]&&a.pop(),i===void 0)throw new TypeError("must provide nocase setting to PathScurryBase ctor");this.nocase=i,this.root=this.newRoot(this.#o),this.roots[this.rootPath]=this.root;let l=this.root,c=a.length-1,f=e.sep,u=this.rootPath,p=false;for(let g of a){let d=c--;l=l.child(g,{relative:new Array(d).fill("..").join(f),relativePosix:new Array(d).fill("..").join("/"),fullpath:u+=(p?"":f)+g}),p=true;}this.cwd=l;}depth(t=this.cwd){return typeof t=="string"&&(t=this.cwd.resolve(t)),t.depth()}childrenCache(){return this.#i}resolve(...t){let e="";for(let n=t.length-1;n>=0;n--){let o=t[n];if(!(!o||o===".")&&(e=e?`${o}/${e}`:o,this.isAbsolute(o)))break}let s=this.#t.get(e);if(s!==void 0)return s;let i=this.cwd.resolve(e).fullpath();return this.#t.set(e,i),i}resolvePosix(...t){let e="";for(let n=t.length-1;n>=0;n--){let o=t[n];if(!(!o||o===".")&&(e=e?`${o}/${e}`:o,this.isAbsolute(o)))break}let s=this.#n.get(e);if(s!==void 0)return s;let i=this.cwd.resolve(e).fullpathPosix();return this.#n.set(e,i),i}relative(t=this.cwd){return typeof t=="string"&&(t=this.cwd.resolve(t)),t.relative()}relativePosix(t=this.cwd){return typeof t=="string"&&(t=this.cwd.resolve(t)),t.relativePosix()}basename(t=this.cwd){return typeof t=="string"&&(t=this.cwd.resolve(t)),t.name}dirname(t=this.cwd){return typeof t=="string"&&(t=this.cwd.resolve(t)),(t.parent||t).fullpath()}async readdir(t=this.cwd,e={withFileTypes:true}){typeof t=="string"?t=this.cwd.resolve(t):t instanceof O||(e=t,t=this.cwd);let{withFileTypes:s}=e;if(t.canReaddir()){let i=await t.readdir();return s?i:i.map(n=>n.name)}else return []}readdirSync(t=this.cwd,e={withFileTypes:true}){typeof t=="string"?t=this.cwd.resolve(t):t instanceof O||(e=t,t=this.cwd);let{withFileTypes:s=true}=e;return t.canReaddir()?s?t.readdirSync():t.readdirSync().map(i=>i.name):[]}async lstat(t=this.cwd){return typeof t=="string"&&(t=this.cwd.resolve(t)),t.lstat()}lstatSync(t=this.cwd){return typeof t=="string"&&(t=this.cwd.resolve(t)),t.lstatSync()}async readlink(t=this.cwd,{withFileTypes:e}={withFileTypes:false}){typeof t=="string"?t=this.cwd.resolve(t):t instanceof O||(e=t.withFileTypes,t=this.cwd);let s=await t.readlink();return e?s:s?.fullpath()}readlinkSync(t=this.cwd,{withFileTypes:e}={withFileTypes:false}){typeof t=="string"?t=this.cwd.resolve(t):t instanceof O||(e=t.withFileTypes,t=this.cwd);let s=t.readlinkSync();return e?s:s?.fullpath()}async realpath(t=this.cwd,{withFileTypes:e}={withFileTypes:false}){typeof t=="string"?t=this.cwd.resolve(t):t instanceof O||(e=t.withFileTypes,t=this.cwd);let s=await t.realpath();return e?s:s?.fullpath()}realpathSync(t=this.cwd,{withFileTypes:e}={withFileTypes:false}){typeof t=="string"?t=this.cwd.resolve(t):t instanceof O||(e=t.withFileTypes,t=this.cwd);let s=t.realpathSync();return e?s:s?.fullpath()}async walk(t=this.cwd,e={}){typeof t=="string"?t=this.cwd.resolve(t):t instanceof O||(e=t,t=this.cwd);let{withFileTypes:s=true,follow:i=false,filter:n,walkFilter:o}=e,h=[];(!n||n(t))&&h.push(s?t:t.fullpath());let a=new Set,l=(f,u)=>{a.add(f),f.readdirCB((p,g)=>{if(p)return u(p);let d=g.length;if(!d)return u();let w=()=>{--d===0&&u();};for(let m of g)(!n||n(m))&&h.push(s?m:m.fullpath()),i&&m.isSymbolicLink()?m.realpath().then(b=>b?.isUnknown()?b.lstat():b).then(b=>b?.shouldWalk(a,o)?l(b,w):w()):m.shouldWalk(a,o)?l(m,w):w();},true);},c=t;return new Promise((f,u)=>{l(c,p=>{if(p)return u(p);f(h);});})}walkSync(t=this.cwd,e={}){typeof t=="string"?t=this.cwd.resolve(t):t instanceof O||(e=t,t=this.cwd);let{withFileTypes:s=true,follow:i=false,filter:n,walkFilter:o}=e,h=[];(!n||n(t))&&h.push(s?t:t.fullpath());let a=new Set([t]);for(let l of a){let c=l.readdirSync();for(let f of c){(!n||n(f))&&h.push(s?f:f.fullpath());let u=f;if(f.isSymbolicLink()){if(!(i&&(u=f.realpathSync())))continue;u.isUnknown()&&u.lstatSync();}u.shouldWalk(a,o)&&a.add(u);}}return h}[Symbol.asyncIterator](){return this.iterate()}iterate(t=this.cwd,e={}){return typeof t=="string"?t=this.cwd.resolve(t):t instanceof O||(e=t,t=this.cwd),this.stream(t,e)[Symbol.asyncIterator]()}[Symbol.iterator](){return this.iterateSync()}*iterateSync(t=this.cwd,e={}){typeof t=="string"?t=this.cwd.resolve(t):t instanceof O||(e=t,t=this.cwd);let{withFileTypes:s=true,follow:i=false,filter:n,walkFilter:o}=e;(!n||n(t))&&(yield s?t:t.fullpath());let h=new Set([t]);for(let a of h){let l=a.readdirSync();for(let c of l){(!n||n(c))&&(yield s?c:c.fullpath());let f=c;if(c.isSymbolicLink()){if(!(i&&(f=c.realpathSync())))continue;f.isUnknown()&&f.lstatSync();}f.shouldWalk(h,o)&&h.add(f);}}}stream(t=this.cwd,e={}){typeof t=="string"?t=this.cwd.resolve(t):t instanceof O||(e=t,t=this.cwd);let{withFileTypes:s=true,follow:i=false,filter:n,walkFilter:o}=e,h=new J({objectMode:true});(!n||n(t))&&h.write(s?t:t.fullpath());let a=new Set,l=[t],c=0,f=()=>{let u=false;for(;!u;){let p=l.shift();if(!p){c===0&&h.end();return}c++,a.add(p);let g=(w,m,b=false)=>{if(w)return h.emit("error",w);if(i&&!b){let x=[];for(let S of m)S.isSymbolicLink()&&x.push(S.realpath().then(y=>y?.isUnknown()?y.lstat():y));if(x.length){Promise.all(x).then(()=>g(null,m,true));return}}for(let x of m)x&&(!n||n(x))&&(h.write(s?x:x.fullpath())||(u=true));c--;for(let x of m){let S=x.realpathCached()||x;S.shouldWalk(a,o)&&l.push(S);}u&&!h.flowing?h.once("drain",f):d||f();},d=true;p.readdirCB(g,true),d=false;}};return f(),h}streamSync(t=this.cwd,e={}){typeof t=="string"?t=this.cwd.resolve(t):t instanceof O||(e=t,t=this.cwd);let{withFileTypes:s=true,follow:i=false,filter:n,walkFilter:o}=e,h=new J({objectMode:true}),a=new Set;(!n||n(t))&&h.write(s?t:t.fullpath());let l=[t],c=0,f=()=>{let u=false;for(;!u;){let p=l.shift();if(!p){c===0&&h.end();return}c++,a.add(p);let g=p.readdirSync();for(let d of g)(!n||n(d))&&(h.write(s?d:d.fullpath())||(u=true));c--;for(let d of g){let w=d;if(d.isSymbolicLink()){if(!(i&&(w=d.realpathSync())))continue;w.isUnknown()&&w.lstatSync();}w.shouldWalk(a,o)&&l.push(w);}}u&&!h.flowing&&h.once("drain",f);};return f(),h}chdir(t=this.cwd){let e=this.cwd;this.cwd=typeof t=="string"?this.cwd.resolve(t):t,this.cwd[Ts](e);}},ot=class extends Jt{sep="\\";constructor(t=process.cwd(),e={}){let{nocase:s=true}=e;typeof t=="string"&&!t.startsWith("file://")&&(t=t.replace(cn,"").replace(fn,"\\")),super(t,win32,"\\",{...e,nocase:s}),this.nocase=s;for(let i=this.cwd;i;i=i.parent)i.nocase=this.nocase;}parseRootPath(t){return win32.parse(t).root.toUpperCase()}newRoot(t){return new Vt(this.rootPath,I,void 0,this.roots,this.nocase,this.childrenCache(),{fs:t})}isAbsolute(t){return t.startsWith("/")||t.startsWith("\\")||/^[a-z]:(\/|\\)/i.test(t)}},ht=class extends Jt{sep="/";constructor(t=process.cwd(),e={}){let{nocase:s=false}=e;super(t,posix,"/",{...e,nocase:s}),this.nocase=s;}parseRootPath(t){return "/"}newRoot(t){return new Yt(this.rootPath,I,void 0,this.roots,this.nocase,this.childrenCache(),{fs:t})}isAbsolute(t){return t.startsWith("/")}},Rt=class extends ht{constructor(t=process.cwd(),e={}){let{nocase:s=true}=e;super(t,{...e,nocase:s});}};process.platform==="win32"?Vt:Yt;var _s=process.platform==="win32"?ot:process.platform==="darwin"?Rt:ht;var pn=r=>r.length>=1,mn=r=>r.length>=1,gn=Symbol.for("nodejs.util.inspect.custom"),at=class r{#t;#n;#i;length;#o;#r;#d;#u;#f;#h;#m=true;constructor(t,e,s,i){if(!pn(t))throw new TypeError("empty pattern list");if(!mn(e))throw new TypeError("empty glob list");if(e.length!==t.length)throw new TypeError("mismatched pattern list and glob list lengths");if(this.length=t.length,s<0||s>=this.length)throw new TypeError("index out of range");if(this.#t=t,this.#n=e,this.#i=s,this.#o=i,this.#i===0){if(this.isUNC()){let n=this.#l()?6:4,o=this.#t.slice(0,n),h=this.#n.slice(0,n),a=this.#t.slice(n),l=this.#n.slice(n);a[0]===""&&(a.shift(),l.shift());let c=[...o,""].join("/"),f=[...h,""].join("/");this.#t=[c,...a],this.#n=[f,...l],this.length=this.#t.length;}else if(this.isDrive()||this.isAbsolute()){let[n,...o]=this.#t,[h,...a]=this.#n;o[0]===""&&(o.shift(),a.shift());let l=`${n}/`,c=`${h}/`;this.#t=[l,...o],this.#n=[c,...a],this.length=this.#t.length;}}}[gn](){return `Pattern <${this.#n.slice(this.#i).join("/")}>`}pattern(){return this.#t[this.#i]}isString(){return typeof this.#t[this.#i]=="string"}isGlobstar(){return this.#t[this.#i]===v}isMatcher(){return typeof this.#t[this.#i]=="object"}globString(){return this.#d=this.#d||(this.#i===0?this.isAbsolute()?this.#n[0]+this.#n.slice(1).join("/"):this.#n.join("/"):this.#n.slice(this.#i).join("/"))}hasMore(){return this.length>this.#i+1}rest(){return this.#r!==void 0?this.#r:this.hasMore()?(this.#r=new r(this.#t,this.#n,this.#i+1,this.#o),this.#r.#h=this.#h,this.#r.#f=this.#f,this.#r.#u=this.#u,this.#r):this.#r=null}#l(){let t=this.#t;return t[2]==="?"&&typeof t[3]=="string"&&/^unc$/i.test(t[3])}isUNC(){let t=this.#t,e=this.#l()?4:2;return this.#f!==void 0?this.#f:this.#f=this.#o==="win32"&&this.#i===0&&t[0]===""&&t[1]===""&&typeof t[e]=="string"&&!!t[e]&&typeof t[e+1]=="string"&&!!t[e+1]}isDrive(){let t=this.#t;return this.#u!==void 0?this.#u:this.#u=this.#o==="win32"&&this.#i===0&&this.length>1&&typeof t[0]=="string"&&/^[a-z]:$/i.test(t[0])}isAbsolute(){let t=this.#t;return this.#h!==void 0?this.#h:this.#h=t[0]===""&&t.length>1||this.isDrive()||this.isUNC()}root(){let t=this.#t[0];return typeof t=="string"&&this.isAbsolute()&&this.#i===0?t:""}checkFollowGlobstar(){return !(this.#i===0||!this.isGlobstar()||!this.#m)}markFollowGlobstar(){return this.#i===0||!this.isGlobstar()||!this.#m?false:(this.#m=false,true)}};var wn=typeof process=="object"&&process&&typeof process.platform=="string"?process.platform:"linux",lt=class{relative;relativeChildren;absolute;absoluteChildren;platform;mmopts;slashRoot;constructor(t,{nobrace:e,nocase:s,noext:i,noglobstar:n,normalize:o,platform:h=wn,root:a,windowsPathsNoEscape:l,allowWindowsEscape:c,braceExpandMax:f=1e4},u){this.relative=[],this.absolute=[],this.relativeChildren=[],this.absoluteChildren=[],this.platform=h,l=!!l||c===false,this.mmopts={braceExpandMax:f,dot:true,nobrace:e,nocase:s,noext:i,noglobstar:n,normalize:o,optimizationLevel:2,platform:h,nocomment:true,nonegate:true,windowsPathsNoEscape:l};let p=u?.resolve(a??"/").fullpath()??"/";this.slashRoot=K(p.replace(/\\/g,"/").replace(/\/$/,""),{magicalBraces:true,windowsPathsNoEscape:l});for(let g of t)this.add(g);}add(t){let e=new D(t,this.mmopts);for(let s=0;s<e.set.length;s++){let i=e.set[s],n=e.globParts[s];if(!i||!n)throw new Error("invalid pattern object");for(;i[0]==="."&&n[0]===".";)i.shift(),n.shift();let o=new at(i,n,0,this.platform),h=o.root()==="/"?`${this.slashRoot}/${o.rest()?.globString()??""}`:o.globString(),a=new D(h,this.mmopts),l=n[n.length-1]==="**",c=o.isAbsolute();c?this.absolute.push(a):this.relative.push(a),l&&(c?this.absoluteChildren.push(a):this.relativeChildren.push(a));}}ignored(t){let e=t.fullpath(),s=`${e}/`,i=t.relative()||".",n=`${i}/`;for(let o of this.relative)if(o.match(i)||o.match(n))return  true;for(let o of this.absolute)if(o.match(e)||o.match(s))return  true;return  false}childrenIgnored(t){let e=`${t.fullpath()}/`,s=`${t.relative()||"."}/`;for(let i of this.relativeChildren)if(i.match(s))return  true;for(let i of this.absoluteChildren)if(i.match(e))return  true;return  false}};var ze=class r{parent;store;constructor(t){this.parent=t;}copy(){return new r(this)}#t(t){let e=this.store?.get(t);return e||!this.parent?e:this.parent.#t(t)}hasWalked(t,e){return !!this.#t(t.fullpath())?.has(e.globString())}storeWalked(t,e){let s=t.fullpath(),i=this.#t(s);i?i.add(e.globString()):(this.store??=new Map).set(s,new Set([e.globString()]));}},Ot=class r{static ABSOLUTE=2;static IF_DIR=1;store=new Map;add(t,e,s){let i=(e?r.ABSOLUTE:0)|(s?r.IF_DIR:0),n=this.store.get(t);this.store.set(t,n===void 0?i:i&n);}},Le=class{store=new Map;add(t,e){if(!t.canReaddir())return;let s=this.store.get(t);s?s.find(i=>i.globString()===e.globString())||s.push(e):this.store.set(t,[e]);}get(t){let e=this.store.get(t);if(!e)throw new Error("attempting to walk unknown path");return e}entries(){return this.keys().map(t=>[t,this.store.get(t)])}keys(){return [...this.store.keys()].filter(t=>t.canReaddir())}},Ft=class r{hasWalkedCache;matches=new Ot;subwalks=new Le;patterns;follow;dot;opts;constructor(t,e){this.opts=t,this.follow=!!t.follow,this.dot=!!t.dot,this.hasWalkedCache=e?e.copy():new ze;}processPatterns(t,e){this.patterns=e;let s=e.map(i=>[t,i]);for(let[i,n]of s){this.hasWalkedCache.storeWalked(i,n);let o=n.root(),h=n.isAbsolute()&&this.opts.absolute!==false;if(o){i=i.resolve(o==="/"&&this.opts.root!==void 0?this.opts.root:o);let f=n.rest();if(f)n=f;else {this.matches.add(i,true,false);continue}}if(i.isENOENT())continue;let a,l,c=false;for(;typeof(a=n.pattern())=="string"&&(l=n.rest());)i=i.resolve(a),n=l,c=true;if(a=n.pattern(),l=n.rest(),c){if(this.hasWalkedCache.hasWalked(i,n))continue;this.hasWalkedCache.storeWalked(i,n);}if(typeof a=="string"){let f=a===".."||a===""||a===".";this.matches.add(i.resolve(a),h,f);continue}else if(a===v){(!i.isSymbolicLink()||this.follow||n.checkFollowGlobstar())&&this.subwalks.add(i,n);let f=l?.pattern(),u=l?.rest();if(!l||(f===""||f===".")&&!u)this.matches.add(i,h,f===""||f===".");else if(f===".."){let p=i.parent||i;u?this.hasWalkedCache.hasWalked(p,u)||this.subwalks.add(p,u):this.matches.add(p,h,true);}}else typeof a=="object"&&this.subwalks.add(i,n);}return this}subwalkTargets(){return this.subwalks.keys()}child(){return new r(this.opts,this.hasWalkedCache)}filterEntries(t,e){let s=this.subwalks.get(t),i=this.child();for(let n of e)for(let o of s){let h=o.isAbsolute(),a=o.pattern(),l=o.rest();a===v?i.testGlobstar(n,o,l,h):typeof a=="object"?i.testMatcher(n,a,l,h):i.testString(n,a,l,h);}return i}testGlobstar(t,e,s,i){if((this.dot||!t.name.startsWith("."))&&(e.hasMore()||this.matches.add(t,i,false),t.canReaddir()&&(this.follow||!t.isSymbolicLink()?this.subwalks.add(t,e):t.isSymbolicLink()&&(s&&e.checkFollowGlobstar()?this.subwalks.add(t,s):e.markFollowGlobstar()&&this.subwalks.add(t,e)))),s){let n=s.pattern();if(typeof n=="string"&&n!==".."&&n!==""&&n!==".")this.testString(t,n,s.rest(),i);else if(n===".."){let o=t.parent||t;this.subwalks.add(o,s);}else typeof n=="object"&&this.testMatcher(t,n,s.rest(),i);}}testMatcher(t,e,s,i){e.testUnchecked(t.name)&&(s?this.subwalks.add(t,s):this.matches.add(t,i,false));}testString(t,e,s,i){t.isNamed(e)&&(s?this.subwalks.add(t,s):this.matches.add(t,i,false));}};var{ABSOLUTE:Zt,IF_DIR:Qt}=Ot,bn=(r,t,e)=>typeof r=="string"?new lt([r],t,e):Array.isArray(r)?new lt(r,t,e):r,te=class{path;patterns;opts;seen=new Set;paused=false;aborted=false;#t=[];#n;#i;signal;maxDepth;includeChildMatches;constructor(t,e,s){if(this.patterns=t,this.path=e,this.opts=s,this.#i=!s.posix&&s.platform==="win32"?"\\":"/",this.includeChildMatches=s.includeChildMatches!==false,(s.ignore||!this.includeChildMatches)&&(this.#n=bn(s.ignore??[],s,e),!this.includeChildMatches&&typeof this.#n.add!="function")){let i="cannot ignore child matches, ignore lacks add() method.";throw new Error(i)}this.maxDepth=s.maxDepth||1/0,s.signal&&(this.signal=s.signal,this.signal.addEventListener("abort",()=>{this.#t.length=0;}));}#o(t){return this.seen.has(t)||!!this.#n?.ignored?.(t)}#r(t){return !!this.#n?.childrenIgnored?.(t)}pause(){this.paused=true;}resume(){if(this.signal?.aborted)return;this.paused=false;let t;for(;!this.paused&&(t=this.#t.shift());)t();}onResume(t){this.paused?this.#t.push(t):t();}async matchCheck(t,e){if(e&&this.opts.nodir)return;let s,i;if(this.opts.realpath){if(s=t.realpathCached()||await t.realpath(),!s)return;i=s;}else i=t;let o=i.isUnknown()||this.opts.stat?await i.lstat():i;if(this.opts.follow&&this.opts.nodir&&o?.isSymbolicLink()){let h=await o.realpath();h&&(h.isUnknown()||this.opts.stat)&&await h.lstat();}return this.matchCheckTest(o,e)}matchCheckTest(t,e){return t&&(this.maxDepth===1/0||t.depth()<=this.maxDepth)&&(!e||t.canReaddir())&&(!this.opts.nodir||!t.isDirectory())&&(!this.opts.nodir||!this.opts.follow||!t.isSymbolicLink()||!t.realpathCached()?.isDirectory())&&!this.#o(t)?t:void 0}matchCheckSync(t,e){if(e&&this.opts.nodir)return;let s,i;if(this.opts.realpath){if(s=t.realpathCached()||t.realpathSync(),!s)return;i=s;}else i=t;let o=i.isUnknown()||this.opts.stat?i.lstatSync():i;if(this.opts.follow&&this.opts.nodir&&o?.isSymbolicLink()){let h=o.realpathSync();h&&(h?.isUnknown()||this.opts.stat)&&h.lstatSync();}return this.matchCheckTest(o,e)}matchFinish(t,e){this.#o(t)||this.#d(t,e);}#d(t,e){if(!this.includeChildMatches&&this.#n?.add){let n=`${t.relativePosix()}/**`;this.#n.add(n);}let s=this.opts.absolute===void 0?e:this.opts.absolute;this.seen.add(t);let i=this.opts.mark&&t.isDirectory()?this.#i:"";if(this.opts.withFileTypes)this.matchEmit(t);else if(s){let n=this.opts.posix?t.fullpathPosix():t.fullpath();this.matchEmit(n+i);}else {let n=this.opts.posix?t.relativePosix():t.relative(),o=this.opts.dotRelative&&!n.startsWith(`..${this.#i}`)?`.${this.#i}`:"";this.matchEmit(n?o+n+i:`.${i}`);}}async match(t,e,s){let i=await this.matchCheck(t,s);i&&this.matchFinish(i,e);}matchSync(t,e,s){let i=this.matchCheckSync(t,s);i&&this.#d(i,e);}walkCB(t,e,s){if(this.signal?.aborted)return s();this.walkCB2(t,e,new Ft(this.opts),s);}walkCB2(t,e,s,i){if(this.#r(t)||this.signal?.aborted)return i();if(this.paused){this.onResume(()=>this.walkCB2(t,e,s,i));return}s.processPatterns(t,e);let n=1,o=()=>{--n===0&&i();};for(let[h,a]of s.matches.store)this.#o(h)||(n++,this.match(h,!!(a&Zt),!!(a&Qt)).then(()=>o()));for(let h of s.subwalkTargets()){if(this.maxDepth!==1/0&&h.depth()>=this.maxDepth)continue;n++;let a=h.readdirCached();h.calledReaddir()?this.walkCB3(h,a,s,o):h.readdirCB((l,c)=>this.walkCB3(h,c,s,o),true);}o();}walkCB3(t,e,s,i){let n=s.filterEntries(t,e),o=1,h=()=>{--o===0&&i();};for(let[a,l]of n.matches.store)this.#o(a)||(o++,this.match(a,!!(l&Zt),!!(l&Qt)).then(()=>h()));for(let[a,l]of n.subwalks.entries())o++,this.walkCB2(a,l,n.child(),h);h();}walkCBSync(t,e,s){if(this.signal?.aborted)return s();this.walkCB2Sync(t,e,new Ft(this.opts),s);}walkCB2Sync(t,e,s,i){if(this.#r(t)||this.signal?.aborted)return i();if(this.paused){this.onResume(()=>this.walkCB2Sync(t,e,s,i));return}s.processPatterns(t,e);let n=1,o=()=>{--n===0&&i();};for(let[h,a]of s.matches.store)this.#o(h)||this.matchSync(h,!!(a&Zt),!!(a&Qt));for(let h of s.subwalkTargets()){if(this.maxDepth!==1/0&&h.depth()>=this.maxDepth)continue;n++;let a=h.readdirSync();this.walkCB3Sync(h,a,s,o);}o();}walkCB3Sync(t,e,s,i){let n=s.filterEntries(t,e),o=1,h=()=>{--o===0&&i();};for(let[a,l]of n.matches.store)this.#o(a)||this.matchSync(a,!!(l&Zt),!!(l&Qt));for(let[a,l]of n.subwalks.entries())o++,this.walkCB2Sync(a,l,n.child(),h);h();}},Tt=class extends te{matches=[];constructor(t,e,s){super(t,e,s);}matchEmit(t){this.matches.push(t);}async walk(){if(this.signal?.aborted)throw this.signal.reason;return this.path.isUnknown()&&await this.path.lstat(),await new Promise((t,e)=>{this.walkCB(this.path,this.patterns,()=>{this.signal?.aborted?e(this.signal.reason):t(this.matches);});}),this.matches}walkSync(){if(this.signal?.aborted)throw this.signal.reason;return this.path.isUnknown()&&this.path.lstatSync(),this.walkCBSync(this.path,this.patterns,()=>{if(this.signal?.aborted)throw this.signal.reason}),this.matches}},_t=class extends te{results;constructor(t,e,s){super(t,e,s),this.results=new J({signal:this.signal,objectMode:true}),this.results.on("drain",()=>this.resume()),this.results.on("resume",()=>this.resume());}matchEmit(t){this.results.write(t),this.results.flowing||this.pause();}stream(){let t=this.path;return t.isUnknown()?t.lstat().then(()=>{this.walkCB(t,this.patterns,()=>this.results.end());}):this.walkCB(t,this.patterns,()=>this.results.end()),this.results}streamSync(){return this.path.isUnknown()&&this.path.lstatSync(),this.walkCBSync(this.path,this.patterns,()=>this.results.end()),this.results}};var Sn=typeof process=="object"&&process&&typeof process.platform=="string"?process.platform:"linux",j=class{absolute;cwd;root;dot;dotRelative;follow;ignore;magicalBraces;mark;matchBase;maxDepth;nobrace;nocase;nodir;noext;noglobstar;pattern;platform;realpath;scurry;stat;signal;windowsPathsNoEscape;withFileTypes;includeChildMatches;opts;patterns;constructor(t,e){if(!e)throw new TypeError("glob options required");if(this.withFileTypes=!!e.withFileTypes,this.signal=e.signal,this.follow=!!e.follow,this.dot=!!e.dot,this.dotRelative=!!e.dotRelative,this.nodir=!!e.nodir,this.mark=!!e.mark,e.cwd?(e.cwd instanceof URL||e.cwd.startsWith("file://"))&&(e.cwd=fileURLToPath(e.cwd)):this.cwd="",this.cwd=e.cwd||"",this.root=e.root,this.magicalBraces=!!e.magicalBraces,this.nobrace=!!e.nobrace,this.noext=!!e.noext,this.realpath=!!e.realpath,this.absolute=e.absolute,this.includeChildMatches=e.includeChildMatches!==false,this.noglobstar=!!e.noglobstar,this.matchBase=!!e.matchBase,this.maxDepth=typeof e.maxDepth=="number"?e.maxDepth:1/0,this.stat=!!e.stat,this.ignore=e.ignore,this.withFileTypes&&this.absolute!==void 0)throw new Error("cannot set absolute and withFileTypes:true");let s=typeof t=="string"?[t]:t;if(this.windowsPathsNoEscape=!!e.windowsPathsNoEscape||e.allowWindowsEscape===false,this.windowsPathsNoEscape&&(s=s.map(l=>l.replace(/\\/g,"/"))),this.matchBase){if(e.noglobstar)throw new TypeError("base matching requires globstar");s=s.map(l=>l.includes("/")?l:`./**/${l}`);}if(this.pattern=s,this.platform=e.platform||Sn,this.opts={...e,platform:this.platform},e.scurry){if(this.scurry=e.scurry,e.nocase!==void 0&&e.nocase!==e.scurry.nocase)throw new Error("nocase option contradicts provided scurry option")}else {let l=e.platform==="win32"?ot:e.platform==="darwin"?Rt:e.platform?ht:_s;this.scurry=new l(this.cwd,{nocase:e.nocase,fs:e.fs});}this.nocase=this.scurry.nocase;let i=this.platform==="darwin"||this.platform==="win32",n={braceExpandMax:1e4,...e,dot:this.dot,matchBase:this.matchBase,nobrace:this.nobrace,nocase:this.nocase,nocaseMagicOnly:i,nocomment:true,noext:this.noext,nonegate:true,optimizationLevel:2,platform:this.platform,windowsPathsNoEscape:this.windowsPathsNoEscape},o=this.pattern.map(l=>new D(l,n)),[h,a]=o.reduce((l,c)=>(l[0].push(...c.set),l[1].push(...c.globParts),l),[[],[]]);this.patterns=h.map((l,c)=>{let f=a[c];if(!f)throw new Error("invalid pattern object");return new at(l,f,0,this.platform)});}async walk(){return await new Tt(this.patterns,this.scurry.cwd,{...this.opts,maxDepth:this.maxDepth!==1/0?this.maxDepth+this.scurry.cwd.depth():1/0,platform:this.platform,nocase:this.nocase,includeChildMatches:this.includeChildMatches}).walk()}walkSync(){return new Tt(this.patterns,this.scurry.cwd,{...this.opts,maxDepth:this.maxDepth!==1/0?this.maxDepth+this.scurry.cwd.depth():1/0,platform:this.platform,nocase:this.nocase,includeChildMatches:this.includeChildMatches}).walkSync()}stream(){return new _t(this.patterns,this.scurry.cwd,{...this.opts,maxDepth:this.maxDepth!==1/0?this.maxDepth+this.scurry.cwd.depth():1/0,platform:this.platform,nocase:this.nocase,includeChildMatches:this.includeChildMatches}).stream()}streamSync(){return new _t(this.patterns,this.scurry.cwd,{...this.opts,maxDepth:this.maxDepth!==1/0?this.maxDepth+this.scurry.cwd.depth():1/0,platform:this.platform,nocase:this.nocase,includeChildMatches:this.includeChildMatches}).streamSync()}iterateSync(){return this.streamSync()[Symbol.iterator]()}[Symbol.iterator](){return this.iterateSync()}iterate(){return this.stream()[Symbol.asyncIterator]()}[Symbol.asyncIterator](){return this.iterate()}};var je=(r,t={})=>{for(let e of Array.isArray(r)?r:[r])if(new D(e,t).hasMagic())return  true;return  false};function ee(r,t={}){return new j(r,t).streamSync()}function Ps(r,t={}){return new j(r,t).stream()}function zs(r,t={}){return new j(r,t).walkSync()}async function Ds(r,t={}){return new j(r,t).walk()}function se(r,t={}){return new j(r,t).iterateSync()}function Ls(r,t={}){return new j(r,t).iterate()}var xn=ee,vn=Object.assign(Ps,{sync:ee}),En=se,kn=Object.assign(Ls,{sync:se}),Cn=Object.assign(zs,{stream:ee,iterate:se}),Ns=Object.assign(Ds,{glob:Ds,globSync:zs,sync:Cn,globStream:Ps,stream:vn,globStreamSync:ee,streamSync:xn,globIterate:Ls,iterate:kn,globIterateSync:se,iterateSync:En,Glob:j,hasMagic:je,escape:K,unescape:st});Ns.glob=Ns;
 
 const encodings = [
     'ascii',
@@ -28701,7 +28804,7 @@ function isValidEncoding(encoding) {
  */
 async function getFiles(filesPattern, exclude) {
     try {
-        return await Ze(filesPattern, { ignore: exclude });
+        return await Ns(filesPattern, { ignore: exclude });
     }
     catch (error) {
         throw new Error(`Error getting files: ${error}`);
@@ -29099,11 +29202,17 @@ const isPlainObject = (val) => {
   const prototype = getPrototypeOf(val);
   return (
     (prototype === null || prototype === Object.prototype || getPrototypeOf(prototype) === null) &&
-    // Treat safe own/inherited Symbol.toStringTag or Symbol.iterator members as
-    // evidence the value is tagged/iterable, while ignoring members reachable
-    // only through shared or terminal prototype boundaries.
-    !hasOwnInPrototypeChain(val, toStringTag) &&
-    !hasOwnInPrototypeChain(val, iterator)
+    // Treat own Symbol.toStringTag or Symbol.iterator members as evidence the
+    // value is tagged/iterable, ignoring members reachable only through shared
+    // or terminal prototype boundaries. This is exactly what
+    // hasOwnInPrototypeChain(val, prop) computes here: every prototype admitted
+    // above (null, Object.prototype, or a terminal null-prototype template) is
+    // a boundary, so the walk never inspects anything but `val`'s own members,
+    // and stops before even those when `val` is itself the boundary
+    // Object.prototype. Checking that inline avoids allocating the walker's
+    // `seen` list twice per call on the mergeConfig / merge hot path.
+    (isPrototypeBoundary(val, prototype, true) ||
+      (!hasOwnProperty(val, toStringTag) && !hasOwnProperty(val, iterator)))
   );
 };
 
@@ -29367,15 +29476,30 @@ const isContextDefined = (context) => !isUndefined(context) && context !== _glob
 function merge(...objs) {
   const { caseless, skipUndefined } = (isContextDefined(this) && this) || {};
   const result = {};
+  // Caseless lookup only applies to string keys — symbol keys are
+  // identity-matched. Every string key that reaches `result` passes through
+  // this index first, so it can never hold two case variants of one key and a
+  // lowercase -> key map is exactly what findKey(result, key) would rescan
+  // Object.keys(result) for on each assignment.
+  const lowerCaseKeys = caseless ? Object.create(null) : null;
   const assignValue = (val, key) => {
     // Skip dangerous property names to prevent prototype pollution
     if (key === '__proto__' || key === 'constructor' || key === 'prototype') {
       return;
     }
 
-    // findKey lowercases the key, so caseless lookup only applies to strings —
-    // symbol keys are identity-matched.
-    const targetKey = (caseless && typeof key === 'string' && findKey(result, key)) || key;
+    let targetKey = key;
+    if (lowerCaseKeys && typeof key === 'string') {
+      const lowerKey = key.toLowerCase();
+      const knownKey = lowerCaseKeys[lowerKey];
+      // A key recorded but absent from `result` was skipped by skipUndefined;
+      // the later spelling wins then, as it does for findKey.
+      if (knownKey !== undefined && hasOwnProperty(result, knownKey)) {
+        targetKey = knownKey;
+      } else {
+        lowerCaseKeys[lowerKey] = key;
+      }
+    }
     // Read via own-prop only — a bare `result[targetKey]` walks the prototype
     // chain, so a polluted Object.prototype value could surface here and get
     // copied into the merged result.
@@ -29399,7 +29523,7 @@ function merge(...objs) {
 
     forEach(source, assignValue);
 
-    if (typeof source !== 'object' || isArray(source)) {
+    if (typeof source !== 'object' || isArray(source) || !Object.getOwnPropertySymbols) {
       continue;
     }
 
@@ -29558,7 +29682,37 @@ const toArray = (thing) => {
   if (!thing) return null;
   if (isArray(thing)) return thing;
   let i = thing.length;
-  if (!isNumber(i)) return null;
+  if (!Number.isSafeInteger(i) || i < 0 || i > 0xffffffff) return null;
+
+  // Bound the copy by actual indexed properties, including hidden and inherited
+  // members of array-like collections, rather than by the declared length alone.
+  const indexes = new Set();
+  const seen = new Set();
+  let source = thing;
+
+  while (source != null && indexes.size < i) {
+    if (seen.has(source)) return null;
+    seen.add(source);
+
+    const prototype = getPrototypeOf(source);
+    if (isPrototypeBoundary(source, prototype, source === thing)) break;
+
+    Object.getOwnPropertyNames(source).forEach((key) => {
+      const index = +key;
+      if (
+        Number.isInteger(index) &&
+        index >= 0 &&
+        index < i &&
+        String(index) === key &&
+        hasOwnProperty(source, key)
+      ) {
+        indexes.add(index);
+      }
+    });
+    source = prototype;
+  }
+
+  if (indexes.size !== i) return null;
   const arr = new Array(i);
   while (i-- > 0) {
     arr[i] = thing[i];
@@ -29972,7 +30126,8 @@ const ignoreDuplicateOf = utils$1.toObjectSet([
  * @returns {Object} Headers parsed into an object
  */
 var parseHeaders = (rawHeaders) => {
-  const parsed = {};
+  // Header names are data, including __proto__; avoid inherited setters.
+  const parsed = Object.create(null);
   let key;
   let val;
   let i;
@@ -30206,9 +30361,22 @@ function parseParameters(value) {
 
 const isValidHeaderName = (str) => /^[-_a-zA-Z0-9^`|~,!#$%&'*+.]+$/.test(str.trim());
 
+// `__proto__` is a valid field name, and the one name the uppercase mapping at
+// the bottom of this file cannot reach: it is inherited from Object.prototype
+// instead of being declared on AxiosHeaders.prototype, so `self.__proto__ = v`
+// runs the inherited setter. That silently discards the header, and an array
+// value replaces the instance prototype, taking every method with it.
+// Store it under the same kind of case variant that mapping uses for `set` and
+// `constructor`. Header lookup is caseless, so it reads back under either
+// spelling, and no own `__proto__` slot is ever created for a later
+// `Object.assign` to copy onto a plain object through the same setter.
+const PROTO_HEADER_SLOT = '__Proto__';
+
+const headerSlot = (name) => (name === '__proto__' ? PROTO_HEADER_SLOT : name);
+
 function matchHeaderValue(context, value, header, filter, isHeaderNameFilter) {
   if (utils$1.isFunction(filter)) {
-    return filter.call(this, value, header);
+    return filter.call(context, value, header);
   }
 
   if (isHeaderNameFilter) {
@@ -30274,7 +30442,7 @@ let AxiosHeaders$1 = class AxiosHeaders {
         _rewrite === true ||
         (_rewrite === undefined && self[key] !== false)
       ) {
-        self[key || _header] = normalizeValue(_value);
+        self[headerSlot(key || _header)] = normalizeValue(_value);
       }
     }
 
@@ -30403,7 +30571,7 @@ let AxiosHeaders$1 = class AxiosHeaders {
 
   normalize(format) {
     const self = this;
-    const headers = {};
+    const headers = Object.create(null);
 
     utils$1.forEach(this, (value, header) => {
       const key = utils$1.findKey(headers, header);
@@ -30414,7 +30582,7 @@ let AxiosHeaders$1 = class AxiosHeaders {
         return;
       }
 
-      const normalized = format ? formatHeader(header) : String(header).trim();
+      const normalized = headerSlot(format ? formatHeader(header) : String(header).trim());
 
       if (normalized !== header) {
         delete self[header];
@@ -30619,6 +30787,61 @@ function aggregateErrorMessage(error) {
   return message || error.name || 'AggregateError';
 }
 
+// Shared with `Axios.prototype.request`, which splices the reconstructed
+// caller frames in ahead of this marker.
+const CAUSED_BY_SEPARATOR = '\nCaused by: ';
+const $causeStack = Symbol('causeStack');
+
+// Match the section we appended, not marker-like text in an error message or
+// a replacement stack supplied by the caller. Do not re-read the cause's stack.
+function getCauseStackIndex(error, stack) {
+  const causeStack = utils$1.hasOwnProp(error, $causeStack) && error[$causeStack];
+
+  return causeStack && stack.endsWith(causeStack) ? stack.length - causeStack.length : -1;
+}
+
+/**
+ * Append the stack of a wrapped error to `target.stack`.
+ *
+ * `cause` already exposes the original error for tooling that walks the standard
+ * cause chain, but many error reporters read `stack` and nothing else. Inlining
+ * the wrapped stack there means those reporters surface the underlying failure
+ * instead of the axios frames that normalized it (see #6670).
+ *
+ * Every read is defensive: a custom `Error.prepareStackTrace` hook, a runtime
+ * without stack support, or a replaced `stack` property can leave the value
+ * missing, non-string, or read-only, and normalizing an error must not throw
+ * because of that.
+ *
+ * @param {Error} target The AxiosError being built.
+ * @param {Error} source The error being wrapped.
+ *
+ * @returns {void}
+ */
+function appendCauseStack(target, source) {
+  try {
+    const sourceStack = source && source.stack;
+
+    if (typeof sourceStack !== 'string' || !sourceStack) {
+      return;
+    }
+
+    const targetStack = target.stack;
+
+    if (typeof targetStack !== 'string' || !targetStack) {
+      return;
+    }
+
+    // Each call to `from()` creates a fresh target. Re-wrapping includes the
+    // previous stack verbatim, adding one cause section per wrap.
+    const causeStack = CAUSED_BY_SEPARATOR + sourceStack;
+    target.stack = targetStack + causeStack;
+    Object.defineProperty(target, $causeStack, { __proto__: null, value: causeStack });
+  } catch (e) {
+    // Ignore failures from custom stack hooks or un-writable stack properties.
+  }
+}
+
 let AxiosError$1 = class AxiosError extends Error {
   static from(error, code, config, request, response, customProps) {
     // `AggregateError` (thrown by Node on dual-stack/Happy-Eyeballs connection
@@ -30644,6 +30867,10 @@ let AxiosError$1 = class AxiosError extends Error {
       configurable: true,
     });
     axiosError.name = error.name;
+
+    // Inline the wrapped stack for reporters that read only `stack`; the `cause`
+    // property above already covers cause-aware tooling.
+    appendCauseStack(axiosError, error);
 
     // Preserve status from the original error if not already set from response
     if (error.status != null && axiosError.status == null) {
@@ -42989,7 +43216,7 @@ function requireCallBindApplyHelpers () {
 	var $call = requireFunctionCall();
 	var $actualApply = requireActualApply();
 
-	/** @type {import('.')} */
+	/** @type {(args: [Function, thisArg?: unknown, ...args: unknown[]]) => Function} TODO FIXME, find a way to use import('.') */
 	callBindApplyHelpers = function callBindBasic(args) {
 		if (args.length < 1 || typeof args[0] !== 'function') {
 			throw new $TypeError('a function is required');
@@ -43185,6 +43412,7 @@ function requireGetIntrinsic () {
 		'%Error%': $Error,
 		'%eval%': eval, // eslint-disable-line no-eval
 		'%EvalError%': $EvalError,
+		'%Float16Array%': typeof Float16Array === 'undefined' ? undefined$1 : Float16Array,
 		'%Float32Array%': typeof Float32Array === 'undefined' ? undefined$1 : Float32Array,
 		'%Float64Array%': typeof Float64Array === 'undefined' ? undefined$1 : Float64Array,
 		'%FinalizationRegistry%': typeof FinalizationRegistry === 'undefined' ? undefined$1 : FinalizationRegistry,
@@ -44485,6 +44713,16 @@ function trimHandlers(handlers) {
   }
 }
 
+// Preserve the array-key coercion used before IDs were stored in a Map, without
+// treating null, empty strings, or noncanonical numeric strings as ID zero.
+function normalizeHandlerId(id) {
+  if (typeof id === 'string' && id !== '' && String(Number(id)) === id) {
+    return Number(id);
+  }
+
+  return id;
+}
+
 function syncHandlerEntries(manager, internals) {
   const handlers = manager.handlers;
   const length = countHandlers(handlers);
@@ -44567,10 +44805,11 @@ class InterceptorManager {
 
     syncHandlerEntries(this, internals);
 
-    const entry = internals.handlerEntries.get(id);
+    const handlerId = normalizeHandlerId(id);
+    const entry = internals.handlerEntries.get(handlerId);
 
     if (entry) {
-      internals.handlerEntries.delete(id);
+      internals.handlerEntries.delete(handlerId);
 
       // Ignore IDs invalidated by clear or direct replacement of handlers.
       if (this.handlers[entry.index] !== entry.handler) {
@@ -44639,6 +44878,7 @@ var transitionalDefaults = {
   legacyInterceptorReqResOrdering: true,
   advertiseZstdAcceptEncoding: false,
   validateStatusUndefinedResolves: true,
+  encodeBasicAuthUsername: false,
 };
 
 var URLSearchParams$1 = require$$5$4.URLSearchParams;
@@ -44811,6 +45051,29 @@ function arrayToObject(arr) {
   return obj;
 }
 
+function normalizeArray(value) {
+  if (!utils$1.isArray(value)) return value;
+
+  const keys = Object.keys(value);
+  return keys.length !== value.length || keys.some((key, index) => key !== String(index))
+    ? arrayToObject(value)
+    : value;
+}
+
+function normalizeArrays(obj) {
+  const pending = [obj];
+  while (pending.length) {
+    const target = pending.pop();
+    Object.keys(target).forEach((key) => {
+      const value = (target[key] = normalizeArray(target[key]));
+      if (utils$1.isArray(value) || utils$1.isPlainObject(value)) {
+        pending.push(value);
+      }
+    });
+  }
+  return obj;
+}
+
 /**
  * It takes a FormData object and returns a JavaScript object
  *
@@ -44832,6 +45095,7 @@ function formDataToJSON(formData) {
 
     if (isLast) {
       if (utils$1.hasOwnProp(target, name)) {
+        target[name] = normalizeArray(target[name]);
         target[name] = utils$1.isArray(target[name])
           ? target[name].concat(value)
           : [target[name], value];
@@ -44862,7 +45126,7 @@ function formDataToJSON(formData) {
       buildPath(parsePropPath(name), value, obj, 0);
     });
 
-    return obj;
+    return normalizeArrays(obj);
   }
 
   return null;
@@ -47428,7 +47692,7 @@ function requireFollowRedirects () {
 	    }
 	  }
 	  // Ensure sensitive headers are always present
-	  if (!isArray(options.sensitiveHeaders)) {
+	  if (!Array.isArray(options.sensitiveHeaders)) {
 	    options.sensitiveHeaders = [];
 	  }
 
@@ -47806,10 +48070,6 @@ function requireFollowRedirects () {
 	  return dot > 0 && subdomain[dot] === "." && subdomain.endsWith(domain);
 	}
 
-	function isArray(value) {
-	  return value instanceof Array;
-	}
-
 	function isString(value) {
 	  return typeof value === "string" || value instanceof String;
 	}
@@ -47827,7 +48087,8 @@ function requireFollowRedirects () {
 	}
 
 	function escapeRegex(regex) {
-	  return regex.replace(/[[\]\\/()*+?.^$|]/g, "\\$&");
+	  // As per https://tc39.es/proposal-regexp-modifiers/#prod-SyntaxCharacter
+	  return regex.replace(/[\^$\\.*+?()[\]{}|]/g, "\\$&");
 	}
 
 	// Exports
@@ -47839,16 +48100,19 @@ function requireFollowRedirects () {
 var followRedirectsExports = requireFollowRedirects();
 var followRedirects = /*@__PURE__*/getDefaultExportFromCjs(followRedirectsExports);
 
-const VERSION$1 = "1.20.0";
+const VERSION$1 = "1.21.1";
 
 function parseProtocol(url) {
   const match = /^([-+\w]{1,25}):(?:\/\/)?/.exec(url);
-  return (match && match[1]) || '';
+  return (match && match[1].toLowerCase()) || '';
 }
 
 // RFC 2397: data:[<mediatype>][;base64],<data>
 // mediatype = type/subtype followed by optional ;name=value parameters
-const DATA_URL_PATTERN = /^([^,;/]+\/[^,;/]+)?((?:;[^,;=]+=[^,;]+)*)(;base64)?,([\s\S]*)$/;
+// The `i` flag makes the `;base64` token case-insensitive, matching the WHATWG
+// URL/Fetch data URL processor (and therefore the fetch adapter and browsers).
+// The remaining character classes do not depend on letter case.
+const DATA_URL_PATTERN = /^([^,;/]+\/[^,;/]+)?((?:;[^,;=]+=[^,;]+)*)(;base64)?,([\s\S]*)$/i;
 
 /**
  * Parse data uri to a Buffer or Blob
@@ -47893,7 +48157,10 @@ function fromDataURI(uri, asBlob, options) {
 
     const buffer =
       encoding === 'base64'
-        ? Buffer.from(body, 'base64')
+        ? Buffer.from(
+            body.replace(/%([\da-f]{2})/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16))),
+            'base64'
+          )
         : Buffer.from(decodeURIComponent(body), encoding);
 
     if (asBlob) {
@@ -48002,10 +48269,14 @@ class AxiosTransformStream extends stream.Transform {
 
     const divider = 1000 / timeWindow;
     const bytesThreshold = maxRate / divider;
-    const minChunkSize =
+    let minChunkSize =
       internals.minChunkSize !== false
         ? Math.max(internals.minChunkSize, bytesThreshold * 0.01)
         : 0;
+
+    if (maxRate) {
+      minChunkSize = Math.min(bytesThreshold, minChunkSize);
+    }
 
     const pushChunk = (_chunk, _callback) => {
       const bytes = Buffer.byteLength(_chunk);
@@ -48025,6 +48296,9 @@ class AxiosTransformStream extends stream.Transform {
     };
 
     const transformChunk = (_chunk, _callback) => {
+      if (this.destroyed) {
+        return _callback();
+      }
       const chunkSize = Buffer.byteLength(_chunk);
       let chunkRemainder = null;
       let maxChunkSize = readableHighWaterMark;
@@ -48053,7 +48327,9 @@ class AxiosTransformStream extends stream.Transform {
         }
 
         if (bytesLeft < maxChunkSize) {
-          maxChunkSize = bytesLeft;
+          // A buffer boundary must consume at least one byte. Carry any
+          // fractional allowance forward in the next accounting window.
+          maxChunkSize = Math.max(1, Math.floor(bytesLeft));
         }
       }
 
@@ -48104,8 +48380,8 @@ const BOUNDARY_ALPHABET = platform.ALPHABET.ALPHA_DIGIT + '-_';
 
 const textEncoder = typeof TextEncoder === 'function' ? new TextEncoder() : new require$$1.TextEncoder();
 
-const CRLF = '\r\n';
-const CRLF_BYTES = textEncoder.encode(CRLF);
+const CRLF$1 = '\r\n';
+const CRLF_BYTES = textEncoder.encode(CRLF$1);
 const CRLF_BYTES_COUNT = 2;
 
 class FormDataPart {
@@ -48115,16 +48391,16 @@ class FormDataPart {
 
     let headers = `Content-Disposition: form-data; name="${escapeName(name)}"${
       !isStringValue && value.name ? `; filename="${escapeName(value.name)}"` : ''
-    }${CRLF}`;
+    }${CRLF$1}`;
 
     if (isStringValue) {
-      value = textEncoder.encode(String(value).replace(/\r?\n|\r\n?/g, CRLF));
+      value = textEncoder.encode(String(value).replace(/\r?\n|\r\n?/g, CRLF$1));
     } else {
       const safeType = String(value.type || 'application/octet-stream').replace(/[\r\n]/g, '');
-      headers += `Content-Type: ${safeType}${CRLF}`;
+      headers += `Content-Type: ${safeType}${CRLF$1}`;
     }
 
-    this.headers = textEncoder.encode(headers + CRLF);
+    this.headers = textEncoder.encode(headers + CRLF$1);
 
     this.contentLength = isStringValue ? value.byteLength : value.size;
 
@@ -48176,8 +48452,8 @@ const formDataToStream = (form, headersHandler, options) => {
     throw new Error('boundary must be 1-70 characters long');
   }
 
-  const boundaryBytes = textEncoder.encode('--' + boundary + CRLF);
-  const footerBytes = textEncoder.encode('--' + boundary + '--' + CRLF);
+  const boundaryBytes = textEncoder.encode('--' + boundary + CRLF$1);
+  const footerBytes = textEncoder.encode('--' + boundary + '--' + CRLF$1);
   let contentLength = footerBytes.byteLength;
 
   const parts = Array.from(form.entries()).map(([name, value]) => {
@@ -48321,7 +48597,7 @@ class Http2Sessions {
         }
 
         stream.once('close', () => {
-          if (!--streamsCount) {
+          if (!--streamsCount && !removed) {
             timer = setTimeout(() => {
               timer = null;
               removeSession();
@@ -48335,6 +48611,7 @@ class Http2Sessions {
 
     session.once('close', removeSession);
     session.once('error', removeSession);
+    session.once('goaway', removeSession);
 
     let entry = [session, options];
 
@@ -48682,7 +48959,20 @@ const normalizeNoProxyHost = (hostname) => {
     hostname = hostname.slice(1, -1);
   }
 
-  const trimmed = trimTrailingDots(hostname);
+  let trimmed = trimTrailingDots(hostname);
+  if (trimmed.indexOf(':') !== -1) {
+    try {
+      trimmed = new URL('http://[' + trimmed + ']/').hostname.slice(1, -1);
+    } catch (_err) {
+      return trimmed;
+    }
+  } else if (/[\u0080-\uffff]/.test(trimmed)) {
+    const prefix = /^[*.]+/.exec(trimmed);
+    const start = prefix ? prefix[0] : '';
+    const ascii = domainToASCII(trimmed.slice(start.length));
+    if (!ascii) return '';
+    trimmed = start + trimTrailingDots(ascii);
+  }
 
   // IPv4 shorthand/octal/hex → dotted-decimal; helper is a no-op for inputs
   // containing ':' (IPv6 and IPv4-mapped IPv6) so we fall through to unmap.
@@ -49018,7 +49308,7 @@ const asyncDecorator =
  * Estimate data: URL byte lengths *without* allocating large buffers.
  * - Fetch percent-decodes a base64 body before decoding it.
  * - Node's Buffer.from(body, 'base64') sizes its backing allocation from the
- *   raw body, including ignored characters and content after padding.
+ *   percent-decoded body, including ignored characters and content after padding.
  * - Non-base64 data is percent-decoded and then encoded as UTF-8.
  */
 const isHexDigit = (charCode) =>
@@ -49066,6 +49356,31 @@ const estimateBase64BufferAllocation = (body) => {
   return Math.floor(((len - padding) * 3) / 4);
 };
 
+const estimatePercentDecodedBase64BufferAllocation = (body) => {
+  // Ordinary Base64 needs only its length and trailing padding.
+  if (body.indexOf('%') === -1) {
+    return estimateBase64BufferAllocation(body);
+  }
+
+  let length = 0;
+  let previous = 0;
+  let last = 0;
+
+  for (let i = 0, len = body.length; i < len; i++) {
+    let code = body.charCodeAt(i);
+    if (code === 37 /* '%' */ && isPercentEncodedByte(body, i, len)) {
+      code = hexValue(body.charCodeAt(i + 1)) * 16 + hexValue(body.charCodeAt(i + 2));
+      i += 2;
+    }
+    length++;
+    previous = last;
+    last = code;
+  }
+
+  const padding = last === 61 ? (previous === 61 ? 2 : 1) : 0;
+  return Math.floor(((length - padding) * 3) / 4);
+};
+
 const estimatePercentDecodedBase64Bytes = (body) => {
   const len = body.length;
   let significant = 0;
@@ -49111,16 +49426,16 @@ const estimatePercentDecodedBase64Bytes = (body) => {
   return base64Bytes(significant);
 };
 
-const estimateDataURLBytes = (url, estimateBase64) => {
+const estimateDataURLBytes = (url, estimateBase64, base64Pattern) => {
   if (!url || typeof url !== 'string') return 0;
-  if (!url.startsWith('data:')) return 0;
+  if (!/^data:/i.test(url)) return 0;
 
   const comma = url.indexOf(',');
   if (comma < 0) return 0;
 
   const meta = url.slice(5, comma);
   const body = url.slice(comma + 1);
-  const isBase64 = /;base64/i.test(meta);
+  const isBase64 = base64Pattern.test(meta);
 
   if (isBase64) {
     return estimateBase64(body);
@@ -49167,18 +49482,20 @@ function estimateDataURLDecodedBytes(url) {
 
   return estimateDataURLBytes(
     fragmentIndex === -1 ? url : url.slice(0, fragmentIndex),
-    estimatePercentDecodedBase64Bytes
+    estimatePercentDecodedBase64Bytes,
+    /; *base64[\t\n\f\r ]*$/i
   );
 }
 
 /**
- * Estimate the Buffer backing allocation used by Node's raw base64 decoder.
+ * Estimate the Buffer backing allocation used after Node's percent-decoding step.
  *
  * @param {string} url
  * @returns {number}
  */
 function estimateDataURLBufferAllocation(url) {
-  return estimateDataURLBytes(url, estimateBase64BufferAllocation);
+  // Match fromDataURI's case-insensitive protocol and encoding suffix.
+  return estimateDataURLBytes(url, estimatePercentDecodedBase64BufferAllocation, /;base64$/i);
 }
 
 const zlibOptions = {
@@ -49232,6 +49549,18 @@ const kAxiosInstalledTunnel = Symbol('axios.http.installedTunnel');
 // so unbounded growth is not a concern in practice.
 const tunnelingAgentCache = new Map();
 const tunnelingAgentCacheUser = new WeakMap();
+const directAgents = new WeakMap();
+const directAgentHooks = ['createConnection', 'getName'];
+const nativeAgentPoolHooks = [
+  'addRequest',
+  'createSocket',
+  'removeSocket',
+  'keepSocketAlive',
+  'reuseSocket',
+  '_getSession',
+  '_cacheSession',
+  '_evictSession',
+];
 // Minimum minor versions where Node's HTTP Agent supports native proxyEnv
 // handling. Checking the selected agent below also covers startup modes such
 // as NODE_OPTIONS=--use-env-proxy and --no-use-env-proxy precedence.
@@ -49278,6 +49607,83 @@ function getProxyEnvAgent(options, configHttpAgent, configHttpsAgent) {
     : configHttpAgent || http.globalAgent;
 }
 
+function getDirectAgent(configuredAgent, transport) {
+  if (
+    !process.allowedNodeEnvironmentFlags ||
+    !process.allowedNodeEnvironmentFlags.has('--use-env-proxy')
+  ) {
+    return configuredAgent;
+  }
+
+  const agent = configuredAgent || transport.globalAgent;
+  const options = agent && agent.options;
+  if (
+    !(agent instanceof transport.Agent) ||
+    agent.protocol !== transport.globalAgent.protocol ||
+    !options ||
+    !utils$1.hasOwnProp(options, 'proxyEnv') ||
+    typeof options.proxyEnv !== 'object' ||
+    options.proxyEnv === null
+  ) {
+    return configuredAgent;
+  }
+
+  // These hooks own pool queues or TLS session state. Neither binding them to
+  // the source agent nor copying them without subclass state preserves their
+  // behavior on a separate direct pool.
+  for (const hook of nativeAgentPoolHooks) {
+    if (
+      utils$1.isFunction(transport.Agent.prototype[hook]) &&
+      agent[hook] !== transport.Agent.prototype[hook]
+    ) {
+      throw new AxiosError$1(
+        'proxy: false cannot adapt an agent overriding ' +
+          hook +
+          '; use an agent constructed without proxyEnv',
+        AxiosError$1.ERR_BAD_OPTION_VALUE
+      );
+    }
+  }
+
+  // Node snapshots proxyEnv when constructing the agent. Keep this check
+  // conservative even when the caller later removes protocol-specific entries.
+  let direct = directAgents.get(agent);
+  if (!direct) {
+    direct = new transport.Agent({ ...options, proxyEnv: undefined });
+
+    // Agent.destroy() does not emit an event. Keep the associated pool under
+    // the configured agent's lifetime, including agents reused after destroy().
+    const destroy = agent.destroy;
+    agent.destroy = function destroyWithDirectAgent() {
+      try {
+        return destroy.apply(this, arguments);
+      } finally {
+        direct.destroy();
+      }
+    };
+    directAgents.set(agent, direct);
+  }
+
+  // Connections and pool keys do not own the direct pool's queues. Preserve
+  // their configured receiver and refresh hooks that change between requests.
+  for (const hook of directAgentHooks) {
+    direct[hook] =
+      agent[hook] === transport.Agent.prototype[hook]
+        ? transport.Agent.prototype[hook]
+        : bind(agent[hook], agent);
+  }
+  return direct;
+}
+
+function setDirectAgent(options, configHttpAgent, configHttpsAgent) {
+  const secure = isHttps.test(options.protocol);
+  const agent = getDirectAgent(secure ? configHttpsAgent : configHttpAgent, secure ? https : http);
+  options.agent = agent;
+  if (options.agents) {
+    options.agents[secure ? 'https' : 'http'] = agent;
+  }
+}
+
 function getTunnelingAgent(agentOptions, userHttpsAgent) {
   const key =
     agentOptions.protocol +
@@ -49293,22 +49699,24 @@ function getTunnelingAgent(agentOptions, userHttpsAgent) {
     : tunnelingAgentCache;
   let agent = cache.get(key);
   if (agent) return agent;
-  // Forward the user's TLS options (custom CA, rejectUnauthorized, client cert,
-  // etc.) into the tunneling agent so they apply to the origin TLS upgrade
-  // performed after CONNECT. Our proxy fields take precedence on conflict.
+  // Preserve per-request TLS options for the proxy connection, with our proxy
+  // fields taking precedence. Global-agent options belong only to the origin
+  // TLS upgrade in the callback below.
   const merged =
     userHttpsAgent && userHttpsAgent.options
       ? { ...userHttpsAgent.options, ...agentOptions }
       : agentOptions;
   agent = new HttpsProxyAgent(merged);
-  if (userHttpsAgent && userHttpsAgent.options) {
-    const originTLSOptions = { ...userHttpsAgent.options };
-    const callback = agent.callback;
-    agent.callback = function axiosTunnelingAgentCallback(req, opts) {
-      // HttpsProxyAgent v5 reads callback opts for the post-CONNECT origin TLS upgrade.
-      return callback.call(this, req, { ...originTLSOptions, ...opts });
-    };
-  }
+  const callback = agent.callback;
+  agent.callback = function axiosTunnelingAgentCallback(req, opts) {
+    // Without a proxy the origin TLS connection would be made by https.globalAgent,
+    // so its options have to reach the tunneled origin too. Resolved per request
+    // because the tunneling agent outlives any one of them.
+    const originTLSAgent = userHttpsAgent || https.globalAgent;
+    const originTLSOptions = originTLSAgent && originTLSAgent.options;
+    // HttpsProxyAgent v5 reads callback opts for the post-CONNECT origin TLS upgrade.
+    return callback.call(this, req, { ...originTLSOptions, ...opts });
+  };
   agent[kAxiosInstalledTunnel] = true;
   cache.set(key, agent);
   return agent;
@@ -49351,6 +49759,10 @@ const http2Sessions = new Http2Sessions();
  * @returns {Object<string, any>}
  */
 function dispatchBeforeRedirect(options, responseDetails, requestDetails) {
+  if (!isSameOriginRedirect(options, requestDetails)) {
+    stripMatchingHeaders(options.headers, new Set(['authorization', 'cookie']));
+    delete options.auth;
+  }
   if (options.beforeRedirects.proxy) {
     options.beforeRedirects.proxy(options);
   }
@@ -49359,6 +49771,9 @@ function dispatchBeforeRedirect(options, responseDetails, requestDetails) {
   }
   if (options.beforeRedirects.sensitiveHeaders) {
     options.beforeRedirects.sensitiveHeaders(options, requestDetails);
+  }
+  if (options.beforeRedirects.direct) {
+    options.beforeRedirects.direct(options);
   }
   if (options.beforeRedirects.config) {
     options.beforeRedirects.config(options, responseDetails, requestDetails);
@@ -49436,6 +49851,14 @@ function setProxy(
   // (which won't carry the marker) is left alone.
   if (isRedirect && options.agent && options.agent[kAxiosInstalledTunnel]) {
     options.agent = undefined;
+  }
+  if (
+    isRedirect &&
+    options.agents &&
+    options.agents.https &&
+    options.agents.https[kAxiosInstalledTunnel]
+  ) {
+    options.agents.https = configHttpsAgent;
   }
   if (proxy) {
     // Read proxy fields without traversing the prototype chain. URL instances expose
@@ -49574,8 +49997,7 @@ function setProxy(
   };
 
   return Boolean(
-    proxy ||
-      (configProxy !== false && allowEnvProxy && isNodeEnvProxyEnabled(proxyEnvAgent))
+    proxy || (configProxy !== false && allowEnvProxy && isNodeEnvProxyEnabled(proxyEnvAgent))
   );
 }
 
@@ -49725,9 +50147,9 @@ var httpAdapter = isHttpAdapterSupported &&
       if (httpVersion === undefined) httpVersion = 1;
       const rawHttpVersion = httpVersion;
       let http2Options = own('http2Options');
+      const configProxy = own('proxy');
       const httpAgent = own('httpAgent');
       const httpsAgent = own('httpsAgent');
-      const configProxy = own('proxy');
       const responseType = own('responseType');
       const responseEncoding = own('responseEncoding');
       const socketPath = own('socketPath');
@@ -49904,6 +50326,20 @@ var httpAdapter = isHttpAdapterSupported &&
           });
         } catch (err) {
           throw AxiosError$1.from(err, AxiosError$1.ERR_BAD_REQUEST, config);
+        }
+
+        // Check bytes before converting the result to text or a stream.
+        if (
+          maxContentLength > -1 &&
+          (responseType === 'blob' ? convertedData.size : convertedData.length) > maxContentLength
+        ) {
+          return reject(
+            new AxiosError$1(
+              'maxContentLength size of ' + maxContentLength + ' exceeded',
+              AxiosError$1.ERR_BAD_RESPONSE,
+              config
+            )
+          );
         }
 
         if (responseType === 'text') {
@@ -50163,15 +50599,15 @@ var httpAdapter = isHttpAdapterSupported &&
       }
       let transport;
       let isNativeTransport = false;
-      // True only for the follow-redirects transport, which applies
-      // options.maxBodyLength itself. Every other transport (http2, native
-      // http/https, a user-supplied custom transport) needs the explicit
-      // byte-counting pipeline below to enforce maxBodyLength on streamed uploads.
-      let transportEnforcesMaxBodyLength = false;
       const isHttpsRequest = isHttps.test(options.protocol);
       // Don't clobber a CONNECT-tunneling agent installed by setProxy() for an
       // HTTPS target.
-      if (options.agent == null) {
+      if (!isHttp2 && configProxy === false) {
+        setDirectAgent(options, httpAgent, httpsAgent);
+        options.beforeRedirects.direct = (redirectOptions) => {
+          setDirectAgent(redirectOptions, httpAgent, httpsAgent);
+        };
+      } else if (options.agent == null) {
         options.agent = isHttpsRequest ? httpsAgent : httpAgent;
       }
 
@@ -50195,7 +50631,6 @@ var httpAdapter = isHttpAdapterSupported &&
           transport = isHttpsRequest ? https : http;
           isNativeTransport = true;
         } else {
-          transportEnforcesMaxBodyLength = true;
           options.sensitiveHeaders = [];
           if (maxRedirects) {
             options.maxRedirects = maxRedirects;
@@ -50585,12 +51020,10 @@ var httpAdapter = isHttpAdapterSupported &&
           }
         });
 
-        // Enforce maxBodyLength for streamed uploads on every transport that
-        // does not apply options.maxBodyLength itself (native http/https, http2,
-        // and user-supplied custom transports). The follow-redirects transport
-        // enforces it on the redirected HTTP/1 path.
+        // Transform decodes string chunks to Buffers before counting, so every
+        // transport receives at most maxBodyLength encoded bytes.
         let uploadStream = data;
-        if (maxBodyLength > -1 && !transportEnforcesMaxBodyLength) {
+        if (maxBodyLength > -1) {
           const limit = maxBodyLength;
           let bytesSent = 0;
           uploadStream = stream.pipeline(
@@ -50628,20 +51061,13 @@ var httpAdapter = isHttpAdapterSupported &&
     });
   };
 
-var isURLSameOrigin = platform.hasStandardBrowserEnv
-  ? ((origin, isMSIE) => (url) => {
-      url = new URL(url, platform.origin);
-
-      return (
-        origin.protocol === url.protocol &&
-        origin.host === url.host &&
-        (isMSIE || origin.port === url.port)
-      );
-    })(
-      new URL(platform.origin),
-      platform.navigator && /(msie|trident)/i.test(platform.navigator.userAgent)
-    )
-  : () => true;
+const decodeCookieValue = (value) => {
+  try {
+    return decodeURIComponent(value);
+  } catch (e) {
+    return value;
+  }
+};
 
 var cookies = platform.hasStandardBrowserEnv
   ? // Standard browser envs support document.cookie
@@ -50672,24 +51098,37 @@ var cookies = platform.hasStandardBrowserEnv
 
       read(name) {
         if (typeof document === 'undefined') return null;
+        const cookieString = document.cookie;
+        if (!cookieString) return null;
         // Match name=value by splitting on the semicolon separator instead of building a
         // RegExp from `name` — interpolating an unescaped string into a RegExp would let
         // metacharacters (e.g. `.+?` in an attacker-influenced cookie name) cause ReDoS or
         // match the wrong cookie. Browsers may serialize cookie pairs as either ";" or
         // "; ", so ignore optional whitespace before each cookie name.
-        const cookies = document.cookie.split(';');
+        const cookies = cookieString.split(';');
         for (let i = 0; i < cookies.length; i++) {
           const cookie = cookies[i].replace(/^\s+/, '');
           const eq = cookie.indexOf('=');
           if (eq !== -1 && cookie.slice(0, eq) === name) {
-            try {
-              return decodeURIComponent(cookie.slice(eq + 1));
-            } catch (e) {
-              return cookie.slice(eq + 1);
-            }
+            return decodeCookieValue(cookie.slice(eq + 1));
           }
         }
         return null;
+      },
+
+      async readAsync(name) {
+        try {
+          const store = typeof window !== 'undefined' && window.cookieStore;
+          if (store && utils$1.isFunction(store.get)) {
+            const cookie = await store.get(name);
+            // Both APIs expose stored bytes; preserve Axios's existing URI decoding.
+            return cookie ? decodeCookieValue(cookie.value) : null;
+          }
+        } catch (e) {
+          // Restricted or unavailable storage retains the synchronous fallback.
+        }
+
+        return this.read(name);
       },
 
       remove(name) {
@@ -50702,20 +51141,248 @@ var cookies = platform.hasStandardBrowserEnv
       read() {
         return null;
       },
+      async readAsync() {
+        return null;
+      },
       remove() {},
     };
+
+var isURLSameOrigin = platform.hasStandardBrowserEnv
+  ? ((origin) => (url) => {
+      url = new URL(url, document.baseURI || platform.origin);
+
+      return (
+        origin.protocol === url.protocol && origin.host === url.host && origin.port === url.port
+      );
+    })(new URL(platform.origin))
+  : () => true;
+
+function assertParamsAcyclic(params) {
+  const pending = [{ value: params }];
+  const active = new WeakSet();
+  const visited = new WeakSet();
+
+  while (pending.length) {
+    const { value, done } = pending.pop();
+    if (!utils$1.isPlainObject(value) && !utils$1.isArray(value)) continue;
+    if (done) {
+      active.delete(value);
+      continue;
+    }
+    if (active.has(value)) {
+      throw new AxiosError$1(
+        'Circular reference detected in params',
+        AxiosError$1.ERR_BAD_OPTION_VALUE
+      );
+    }
+    if (visited.has(value)) continue;
+    visited.add(value);
+    active.add(value);
+    pending.push({ value, done: true });
+
+    const keys = Object.keys(value);
+    if (Object.getOwnPropertySymbols && Object.getOwnPropertyDescriptor) {
+      Object.getOwnPropertySymbols(value).forEach((key) => {
+        const descriptor = Object.getOwnPropertyDescriptor(value, key);
+        if (descriptor && descriptor.enumerable) keys.push(key);
+      });
+    }
+    // Shallow array elements retain fields filtered during plain-object merges.
+    // Inspect reserved data properties without evaluating their accessors.
+    keys.forEach((key) => {
+      if (key === '__proto__' || key === 'constructor' || key === 'prototype') {
+        const descriptor = Object.getOwnPropertyDescriptor(value, key);
+        if (descriptor && utils$1.hasOwnProp(descriptor, 'value')) {
+          pending.push({ value: descriptor.value });
+        }
+      } else {
+        pending.push({ value: value[key] });
+      }
+    });
+  }
+}
 
 const headersToObject = (thing) => (thing instanceof AxiosHeaders$1 ? { ...thing } : thing);
 
 const ownEnumerableKeys = (thing) => {
   if (Object.getOwnPropertySymbols && Object.getOwnPropertyDescriptor) {
     return Object.keys(thing).concat(
-      Object.getOwnPropertySymbols(thing).filter(
-        (symbol) => Object.getOwnPropertyDescriptor(thing, symbol).enumerable
-      )
+      Object.getOwnPropertySymbols(thing).filter((symbol) => {
+        const descriptor = Object.getOwnPropertyDescriptor(thing, symbol);
+        return descriptor && descriptor.enumerable;
+      })
     );
   }
   return Object.keys(thing);
+};
+
+// Copy params without recursive merges so the serializer remains responsible
+// for its depth policy. Only visit defaults that contribute to the result.
+function mergeParams(a, b) {
+  const pending = [];
+  const copies = new WeakMap();
+  const empty = {};
+
+  function copy(target, source) {
+    if (!utils$1.isPlainObject(source)) {
+      return utils$1.isArray(source) ? source.slice() : source;
+    }
+
+    const base = utils$1.isPlainObject(target) ? target : empty;
+    let bases = copies.get(source);
+    if (!bases) {
+      bases = new WeakMap();
+      copies.set(source, bases);
+    }
+    if (bases.has(base)) return bases.get(base);
+
+    const result = {};
+    bases.set(base, result);
+    pending.push({ base, source, result });
+    return result;
+  }
+
+  const result = utils$1.isUndefined(b) ? copy(undefined, a) : copy(a, b);
+  while (pending.length) {
+    const { base, source, result: target } = pending.pop();
+    const baseKeys = new Set(ownEnumerableKeys(base));
+    const sourceKeys = new Set(ownEnumerableKeys(source));
+    const keys = new Set([...baseKeys, ...sourceKeys]);
+
+    keys.forEach((key) => {
+      if (key === '__proto__' || key === 'constructor' || key === 'prototype') return;
+      const hasSource = sourceKeys.has(key);
+      const value = hasSource ? source[key] : undefined;
+      const previous =
+        (!hasSource || utils$1.isPlainObject(value)) && baseKeys.has(key) ? base[key] : undefined;
+      target[key] = hasSource ? copy(previous, value) : copy(undefined, previous);
+    });
+  }
+
+  assertParamsAcyclic(result);
+  return result;
+}
+
+function getMergedValue(target, source, prop, caseless) {
+  if (utils$1.isPlainObject(target) && utils$1.isPlainObject(source)) {
+    return utils$1.merge.call({ caseless }, target, source);
+  } else if (utils$1.isPlainObject(source)) {
+    return utils$1.merge({}, source);
+  } else if (utils$1.isArray(source)) {
+    return source.slice();
+  }
+  return source;
+}
+
+function mergeDeepProperties(a, b, prop, caseless) {
+  if (!utils$1.isUndefined(b)) {
+    return getMergedValue(a, b, prop, caseless);
+  } else if (!utils$1.isUndefined(a)) {
+    return getMergedValue(undefined, a, prop, caseless);
+  }
+}
+
+// eslint-disable-next-line consistent-return
+function valueFromConfig2(a, b) {
+  if (!utils$1.isUndefined(b)) {
+    return getMergedValue(undefined, b);
+  }
+}
+
+// eslint-disable-next-line consistent-return
+function defaultToConfig2(a, b) {
+  if (!utils$1.isUndefined(b)) {
+    return getMergedValue(undefined, b);
+  } else if (!utils$1.isUndefined(a)) {
+    return getMergedValue(undefined, a);
+  }
+}
+
+function getMergedTransitionalOption(config1, config2, prop) {
+  const transitional2 = utils$1.hasOwnProp(config2, 'transitional')
+    ? config2.transitional
+    : undefined;
+
+  if (!utils$1.isUndefined(transitional2)) {
+    if (utils$1.isPlainObject(transitional2)) {
+      if (utils$1.hasOwnProp(transitional2, prop)) {
+        return transitional2[prop];
+      }
+    } else {
+      return undefined;
+    }
+  }
+
+  const transitional1 = utils$1.hasOwnProp(config1, 'transitional')
+    ? config1.transitional
+    : undefined;
+
+  if (utils$1.isPlainObject(transitional1) && utils$1.hasOwnProp(transitional1, prop)) {
+    return transitional1[prop];
+  }
+
+  return undefined;
+}
+
+// eslint-disable-next-line consistent-return
+function mergeDirectKeys(a, b, prop, config1, config2) {
+  if (utils$1.hasOwnProp(config2, prop)) {
+    return getMergedValue(a, b);
+  } else if (utils$1.hasOwnProp(config1, prop)) {
+    return getMergedValue(undefined, a);
+  }
+}
+
+function mergeHeaders(a, b, prop) {
+  return mergeDeepProperties(headersToObject(a), headersToObject(b), prop, true);
+}
+
+// Null-proto, frozen descriptor so a polluted Object.prototype.get cannot turn
+// this data descriptor into an accessor descriptor on the way in.
+// defineProperty only reads it, so one shared instance serves every call.
+const hasOwnPropertyDescriptor = Object.freeze({
+  __proto__: null,
+  value: Object.prototype.hasOwnProperty,
+  enumerable: false,
+  writable: true,
+  configurable: true,
+});
+
+// The strategy table and the strategies above are stateless, so they are
+// built once at module load instead of on every call: mergeConfig runs at
+// most twice per request (once from a method alias, once from `_request`).
+const mergeMap = {
+  url: valueFromConfig2,
+  method: valueFromConfig2,
+  data: valueFromConfig2,
+  baseURL: defaultToConfig2,
+  transformRequest: defaultToConfig2,
+  transformResponse: defaultToConfig2,
+  params: mergeParams,
+  paramsSerializer: defaultToConfig2,
+  timeout: defaultToConfig2,
+  timeoutErrorMessage: defaultToConfig2,
+  withCredentials: defaultToConfig2,
+  withXSRFToken: defaultToConfig2,
+  adapter: defaultToConfig2,
+  responseType: defaultToConfig2,
+  xsrfCookieName: defaultToConfig2,
+  xsrfHeaderName: defaultToConfig2,
+  onUploadProgress: defaultToConfig2,
+  onDownloadProgress: defaultToConfig2,
+  decompress: defaultToConfig2,
+  maxContentLength: defaultToConfig2,
+  maxBodyLength: defaultToConfig2,
+  beforeRedirect: defaultToConfig2,
+  transport: defaultToConfig2,
+  httpAgent: defaultToConfig2,
+  httpsAgent: defaultToConfig2,
+  cancelToken: defaultToConfig2,
+  socketPath: defaultToConfig2,
+  allowedSocketPaths: defaultToConfig2,
+  responseEncoding: defaultToConfig2,
+  validateStatus: mergeDirectKeys,
+  headers: mergeHeaders,
 };
 
 /**
@@ -50737,133 +51404,25 @@ function mergeConfig$1(config1, config2) {
   // `hasOwnProperty` is restored as a non-enumerable own slot to preserve
   // ergonomics for user code that relies on it.
   const config = Object.create(null);
-  Object.defineProperty(config, 'hasOwnProperty', {
-    // Null-proto descriptor so a polluted Object.prototype.get cannot turn
-    // this data descriptor into an accessor descriptor on the way in.
-    __proto__: null,
-    value: Object.prototype.hasOwnProperty,
-    enumerable: false,
-    writable: true,
-    configurable: true,
-  });
+  Object.defineProperty(config, 'hasOwnProperty', hasOwnPropertyDescriptor);
 
-  function getMergedValue(target, source, prop, caseless) {
-    if (utils$1.isPlainObject(target) && utils$1.isPlainObject(source)) {
-      return utils$1.merge.call({ caseless }, target, source);
-    } else if (utils$1.isPlainObject(source)) {
-      return utils$1.merge({}, source);
-    } else if (utils$1.isArray(source)) {
-      return source.slice();
-    }
-    return source;
-  }
+  const keys = ownEnumerableKeys({ ...config1, ...config2 });
 
-  function mergeDeepProperties(a, b, prop, caseless) {
-    if (!utils$1.isUndefined(b)) {
-      return getMergedValue(a, b, prop, caseless);
-    } else if (!utils$1.isUndefined(a)) {
-      return getMergedValue(undefined, a, prop, caseless);
-    }
-  }
-
-  // eslint-disable-next-line consistent-return
-  function valueFromConfig2(a, b) {
-    if (!utils$1.isUndefined(b)) {
-      return getMergedValue(undefined, b);
-    }
-  }
-
-  // eslint-disable-next-line consistent-return
-  function defaultToConfig2(a, b) {
-    if (!utils$1.isUndefined(b)) {
-      return getMergedValue(undefined, b);
-    } else if (!utils$1.isUndefined(a)) {
-      return getMergedValue(undefined, a);
-    }
-  }
-
-  function getMergedTransitionalOption(prop) {
-    const transitional2 = utils$1.hasOwnProp(config2, 'transitional')
-      ? config2.transitional
-      : undefined;
-
-    if (!utils$1.isUndefined(transitional2)) {
-      if (utils$1.isPlainObject(transitional2)) {
-        if (utils$1.hasOwnProp(transitional2, prop)) {
-          return transitional2[prop];
-        }
-      } else {
-        return undefined;
-      }
-    }
-
-    const transitional1 = utils$1.hasOwnProp(config1, 'transitional')
-      ? config1.transitional
-      : undefined;
-
-    if (utils$1.isPlainObject(transitional1) && utils$1.hasOwnProp(transitional1, prop)) {
-      return transitional1[prop];
-    }
-
-    return undefined;
-  }
-
-  // eslint-disable-next-line consistent-return
-  function mergeDirectKeys(a, b, prop) {
-    if (utils$1.hasOwnProp(config2, prop)) {
-      return getMergedValue(a, b);
-    } else if (utils$1.hasOwnProp(config1, prop)) {
-      return getMergedValue(undefined, a);
-    }
-  }
-
-  const mergeMap = {
-    url: valueFromConfig2,
-    method: valueFromConfig2,
-    data: valueFromConfig2,
-    baseURL: defaultToConfig2,
-    transformRequest: defaultToConfig2,
-    transformResponse: defaultToConfig2,
-    paramsSerializer: defaultToConfig2,
-    timeout: defaultToConfig2,
-    timeoutErrorMessage: defaultToConfig2,
-    withCredentials: defaultToConfig2,
-    withXSRFToken: defaultToConfig2,
-    adapter: defaultToConfig2,
-    responseType: defaultToConfig2,
-    xsrfCookieName: defaultToConfig2,
-    xsrfHeaderName: defaultToConfig2,
-    onUploadProgress: defaultToConfig2,
-    onDownloadProgress: defaultToConfig2,
-    decompress: defaultToConfig2,
-    maxContentLength: defaultToConfig2,
-    maxBodyLength: defaultToConfig2,
-    beforeRedirect: defaultToConfig2,
-    transport: defaultToConfig2,
-    httpAgent: defaultToConfig2,
-    httpsAgent: defaultToConfig2,
-    cancelToken: defaultToConfig2,
-    socketPath: defaultToConfig2,
-    allowedSocketPaths: defaultToConfig2,
-    responseEncoding: defaultToConfig2,
-    validateStatus: mergeDirectKeys,
-    headers: (a, b, prop) =>
-      mergeDeepProperties(headersToObject(a), headersToObject(b), prop, true),
-  };
-
-  utils$1.forEach(ownEnumerableKeys({ ...config1, ...config2 }), function computeConfigValue(prop) {
-    if (prop === '__proto__' || prop === 'constructor' || prop === 'prototype') return;
+  for (let i = 0, len = keys.length; i < len; i++) {
+    const prop = keys[i];
+    if (prop === '__proto__' || prop === 'constructor' || prop === 'prototype') continue;
     const merge = utils$1.hasOwnProp(mergeMap, prop) ? mergeMap[prop] : mergeDeepProperties;
     const a = utils$1.hasOwnProp(config1, prop) ? config1[prop] : undefined;
     const b = utils$1.hasOwnProp(config2, prop) ? config2[prop] : undefined;
-    const configValue = merge(a, b, prop);
+    const configValue =
+      merge === mergeDirectKeys ? merge(a, b, prop, config1, config2) : merge(a, b, prop);
     (utils$1.isUndefined(configValue) && merge !== mergeDirectKeys) || (config[prop] = configValue);
-  });
+  }
 
   if (
     utils$1.hasOwnProp(config2, 'validateStatus') &&
     utils$1.isUndefined(config2.validateStatus) &&
-    getMergedTransitionalOption('validateStatusUndefinedResolves') === false
+    getMergedTransitionalOption(config1, config2, 'validateStatusUndefinedResolves') === false
   ) {
     if (utils$1.hasOwnProp(config1, 'validateStatus')) {
       config.validateStatus = getMergedValue(undefined, config1.validateStatus);
@@ -50888,7 +51447,9 @@ const encodeUTF8$1 = (str) =>
     String.fromCharCode(parseInt(hex, 16))
   );
 
-function resolveConfig(config) {
+const readCookie = (name) => cookies.read(name);
+
+function resolveConfig(config, readXsrfCookie = readCookie) {
   const newConfig = mergeConfig$1({}, config);
 
   // Read only own properties to prevent prototype pollution gadgets
@@ -50917,11 +51478,22 @@ function resolveConfig(config) {
   if (auth) {
     const username = utils$1.getSafeProp(auth, 'username') || '';
     const password = utils$1.getSafeProp(auth, 'password') || '';
+    const transitional = own('transitional');
+    const encodeUsername =
+      transitional &&
+      utils$1.hasOwnProp(transitional, 'encodeBasicAuthUsername') &&
+      transitional.encodeBasicAuthUsername === true;
 
     try {
       headers.set(
         'Authorization',
-        'Basic ' + btoa(username + ':' + (password ? encodeUTF8$1(password) : ''))
+        // Preserve legacy username bytes unless the caller opts in to UTF-8.
+        'Basic ' +
+          btoa(
+            (encodeUsername ? encodeUTF8$1(username) : username) +
+              ':' +
+              (password ? encodeUTF8$1(password) : '')
+          )
       );
     } catch (e) {
       throw AxiosError$1.from(e, AxiosError$1.ERR_BAD_OPTION_VALUE, config);
@@ -50959,7 +51531,7 @@ function resolveConfig(config) {
       withXSRFToken === true || (withXSRFToken == null && isURLSameOrigin(newConfig.url));
 
     if (shouldSendXSRF) {
-      const xsrfValue = xsrfHeaderName && xsrfCookieName && cookies.read(xsrfCookieName);
+      const xsrfValue = xsrfHeaderName && xsrfCookieName && readXsrfCookie(xsrfCookieName);
 
       if (xsrfValue) {
         headers.set(xsrfHeaderName, xsrfValue);
@@ -50975,17 +51547,60 @@ const isXHRAdapterSupported = typeof XMLHttpRequest !== 'undefined';
 var xhrAdapter = isXHRAdapterSupported &&
   function (config) {
     return new Promise(function dispatchXhrRequest(resolve, reject) {
-      const _config = resolveConfig(config);
+      let useAsyncXsrf;
+      try {
+        const store =
+          platform.hasStandardBrowserEnv && typeof window !== 'undefined' && window.cookieStore;
+        useAsyncXsrf = store && utils$1.isFunction(store.get);
+      } catch (e) {
+        // A restricted Cookie Store getter must retain the synchronous fallback.
+      }
+      let xsrfCookieName;
+      const _config = resolveConfig(
+        config,
+        useAsyncXsrf
+          ? (name) => {
+              xsrfCookieName = name;
+              return null;
+            }
+          : undefined
+      );
       let requestData = _config.data;
       const requestHeaders = AxiosHeaders$1.from(_config.headers).normalize();
       let { responseType, onUploadProgress, onDownloadProgress } = _config;
       let onCanceled;
+      let timeoutId;
       let uploadThrottled, downloadThrottled;
       let flushUpload, flushDownload, flushDownloadWithEvent;
 
       function done() {
-        flushUpload && flushUpload(); // flush events
-        flushDownload && flushDownload(); // flush events
+        clearTimeout(timeoutId);
+        // A final progress callback must not prevent the remaining cleanup.
+        // Report errors asynchronously, as onloadend and the throttle timer do.
+        try {
+          flushUpload && flushUpload(); // flush events
+        } catch (err) {
+          setTimeout(() => {
+            throw err;
+          });
+        }
+        try {
+          flushDownload && flushDownload(); // flush events
+        } catch (err) {
+          setTimeout(() => {
+            throw err;
+          });
+        }
+
+        // A flush can synchronously cancel the request and reenter done().
+        // In that case the inner call has already detached these listeners.
+        if (request) {
+          downloadThrottled && request.removeEventListener('progress', downloadThrottled);
+          if (request.upload) {
+            uploadThrottled && request.upload.removeEventListener('progress', uploadThrottled);
+            flushUpload && request.upload.removeEventListener('loadend', flushUpload);
+          }
+        }
 
         _config.cancelToken && _config.cancelToken.unsubscribe(onCanceled);
 
@@ -51136,6 +51751,7 @@ var xhrAdapter = isXHRAdapterSupported &&
 
       // Handle timeout
       request.ontimeout = function handleTimeout() {
+        if (!request) return;
         let timeoutErrorMessage = _config.timeout
           ? 'timeout of ' + _config.timeout + 'ms exceeded'
           : 'timeout exceeded';
@@ -51159,13 +51775,6 @@ var xhrAdapter = isXHRAdapterSupported &&
 
       // Remove Content-Type if data is undefined
       requestData === undefined && requestHeaders.setContentType(null);
-
-      // Add headers to the request
-      if ('setRequestHeader' in request) {
-        utils$1.forEach(toByteStringHeaderObject(requestHeaders), function setRequestHeader(val, key) {
-          request.setRequestHeader(key, val);
-        });
-      }
 
       // Add withCredentials to request if needed
       if (!utils$1.isUndefined(_config.withCredentials)) {
@@ -51203,18 +51812,22 @@ var xhrAdapter = isXHRAdapterSupported &&
             return;
           }
           reject(!cancel || cancel.type ? new CanceledError$1(null, config, request) : cancel);
-          request.abort();
+          const xhr = request;
           done();
           request = null;
+          xhr.abort();
         };
 
         _config.cancelToken && _config.cancelToken.subscribe(onCanceled);
+        if (!request) return;
         if (_config.signal) {
           _config.signal.aborted
             ? onCanceled()
             : _config.signal.addEventListener('abort', onCanceled);
         }
       }
+
+      if (!request) return;
 
       const protocol = parseProtocol(_config.url);
 
@@ -51230,8 +51843,73 @@ var xhrAdapter = isXHRAdapterSupported &&
         return;
       }
 
-      // Send the request
-      request.send(requestData || null);
+      const sendRequest = () => {
+        if (!request) return;
+        // Apply headers after an asynchronous XSRF read so existing headers are
+        // replaced through AxiosHeaders rather than appended by the native XHR.
+        if ('setRequestHeader' in request) {
+          utils$1.forEach(
+            toByteStringHeaderObject(requestHeaders),
+            function setRequestHeader(val, key) {
+              request.setRequestHeader(key, val);
+            }
+          );
+        }
+        request.send(requestData || null);
+      };
+
+      if (xsrfCookieName) {
+        // Native XHR timeout starts at send(). Cover cookie preparation and the
+        // subsequent request with the same budget and existing timeout handler.
+        const now =
+          typeof performance !== 'undefined' && utils$1.isFunction(performance.now)
+            ? () => performance.now()
+            : Date.now;
+        const deadline = request.timeout > 0 ? now() + Number(request.timeout) : undefined;
+        const abortOnTimeout = () => {
+          if (!request) return;
+          const xhr = request;
+          xhr.ontimeout();
+          xhr.abort();
+        };
+        if (deadline !== undefined) {
+          const scheduleTimeout = () => {
+            const remaining = deadline - now();
+            if (remaining > 0) {
+              // Browser timers overflow above the signed 32-bit delay limit.
+              timeoutId = setTimeout(scheduleTimeout, Math.min(remaining, 0x7fffffff));
+            } else {
+              abortOnTimeout();
+            }
+          };
+          scheduleTimeout();
+        }
+
+        cookies
+          .readAsync(xsrfCookieName)
+          .then((value) => {
+            if (!request) return;
+            // Promise callbacks may run before an overdue timer after a busy task.
+            if (deadline !== undefined && now() >= deadline) {
+              abortOnTimeout();
+              return;
+            }
+            if (value) {
+              const headerName =
+                utils$1.hasOwnProp(_config, 'xsrfHeaderName') && _config.xsrfHeaderName;
+              requestHeaders.set(headerName, value);
+            }
+            sendRequest();
+          })
+          .catch((error) => {
+            if (!request) return;
+            reject(AxiosError$1.from(error, null, config, request));
+            done();
+            request = null;
+          });
+      } else {
+        sendRequest();
+      }
     });
   };
 
@@ -51267,12 +51945,15 @@ const composeSignals = (signals, timeout) => {
     }, timeout);
 
   const unsubscribe = () => {
-    if (!signals) { return; }
+    if (!signals) {
+      return;
+    }
     timer && clearTimeout(timer);
     timer = null;
     signals.forEach((signal) => {
-      signal.unsubscribe
-        ? signal.unsubscribe(onabort)
+      const unsubscribeSignal = utils$1.getSafeProp(signal, 'unsubscribe');
+      utils$1.isFunction(unsubscribeSignal)
+        ? unsubscribeSignal.call(signal, onabort)
         : signal.removeEventListener('abort', onabort);
     });
     signals = null;
@@ -51388,6 +52069,151 @@ const trackStream = (stream, chunkSize, onProgress, onFinish) => {
   );
 };
 
+const CRLF = '\r\n';
+const normalizeLines = (value) => String(value).replace(/\r\n|\r|\n/g, CRLF);
+const escapeName = (value) =>
+  String(value).replace(/[\r\n"]/g, (char) =>
+    char === '\r' ? '%0D' : char === '\n' ? '%0A' : '%22'
+  );
+
+// Count UTF-8 bytes without allocating an encoded copy of a field. FormData
+// string values normalize line endings; Blob/File contents remain unchanged.
+const stringBytes = (value, normalize) => {
+  let length = 0;
+  for (let i = 0; i < value.length; i++) {
+    const code = value.charCodeAt(i);
+    if (normalize && (code === 13 || code === 10)) {
+      if (code === 13 && value.charCodeAt(i + 1) === 10) i++;
+      length += 2;
+    } else if (code < 0x80) {
+      length++;
+    } else if (code < 0x800) {
+      length += 2;
+    } else if (
+      code >= 0xd800 &&
+      code <= 0xdbff &&
+      value.charCodeAt(i + 1) >= 0xdc00 &&
+      value.charCodeAt(i + 1) <= 0xdfff
+    ) {
+      length += 4;
+      i++;
+    } else {
+      length += 3;
+    }
+  }
+  return length;
+};
+
+// Describe serialization failures independently of any request library.
+class FormDataError extends TypeError {
+  constructor(message, reason) {
+    super(message);
+    this.name = 'FormDataError';
+    this.reason = reason;
+  }
+}
+
+// The caller supplies the boundary, Blob implementation, and limit error.
+function formDataToBlob(form, Blob, limit, limitError, boundary) {
+  if (!utils$1.isFunction(Blob)) {
+    throw new FormDataError('Blob is not supported', 'blob');
+  }
+
+  if (
+    !utils$1.isString(boundary) ||
+    !/^[A-Za-z0-9'()+_,./:=? -]{1,70}$/.test(boundary) ||
+    / $/.test(boundary)
+  ) {
+    throw new FormDataError('Invalid multipart boundary', 'boundary');
+  }
+  const footer = '--' + boundary + '--' + CRLF;
+  let length = footer.length;
+  const parts = [];
+  const checkLength = (extra) => {
+    if (length + extra > limit) throw limitError();
+  };
+  checkLength(0);
+
+  for (const [name, value] of form) {
+    const isString = utils$1.isString(value);
+    const valueLength = isString ? stringBytes(value, true) : value.size;
+    if (!Number.isFinite(valueLength) || valueLength < 0) {
+      throw new FormDataError('Unsupported FormData part size', 'part');
+    }
+    // Reject large values and names before building normalized header strings.
+    checkLength(
+      valueLength +
+        stringBytes(name, true) +
+        (!isString && value.name ? stringBytes(value.name, false) : 0) +
+        (!isString && value.type ? stringBytes(value.type, false) : 0)
+    );
+
+    let header =
+      '--' +
+      boundary +
+      CRLF +
+      'Content-Disposition: form-data; name="' +
+      escapeName(normalizeLines(name)) +
+      '"';
+    if (!isString) {
+      header +=
+        '; filename="' +
+        escapeName(utils$1.isString(value.name) ? value.name : 'blob') +
+        '"' +
+        CRLF +
+        'Content-Type: ' +
+        String(value.type || 'application/octet-stream').replace(/[\r\n]/g, '');
+    }
+    header += CRLF + CRLF;
+    const partLength = stringBytes(header, false) + valueLength + CRLF.length;
+    checkLength(partLength);
+    length += partLength;
+    parts.push({ header, value, isString });
+  }
+
+  // Native Blob composition retains existing Blob/File data. No file is read
+  // and no complete multipart ArrayBuffer is created to determine its length.
+  const blobParts = [];
+  for (const part of parts) {
+    blobParts.push(part.header, part.isString ? normalizeLines(part.value) : part.value, CRLF);
+  }
+  blobParts.push(footer);
+  return new Blob(blobParts, { type: 'multipart/form-data; boundary=' + boundary });
+}
+
+function createMultipartBody(form, Blob, limit, limitError, boundary) {
+  // Report missing Blob support before trying to select a random source.
+  if (!utils$1.isFunction(Blob)) {
+    throw new AxiosError$1('Blob is not supported', AxiosError$1.ERR_NOT_SUPPORT);
+  }
+
+  if (boundary === undefined) {
+    if (utils$1.isFunction(platform.generateString)) {
+      boundary = 'axios-' + platform.generateString(36, '0123456789abcdef');
+    } else {
+      const crypto = utils$1.global.crypto;
+      if (!crypto || !utils$1.isFunction(crypto.getRandomValues)) {
+        throw new AxiosError$1('Random byte generation is not supported', AxiosError$1.ERR_NOT_SUPPORT);
+      }
+      const random = new Uint8Array(18);
+      crypto.getRandomValues(random);
+      boundary =
+        'axios-' + Array.from(random, (value) => ('0' + value.toString(16)).slice(-2)).join('');
+    }
+  }
+
+  try {
+    return formDataToBlob(form, Blob, limit, limitError, boundary);
+  } catch (error) {
+    if (error instanceof FormDataError) {
+      const code =
+        error.reason === 'boundary' ? AxiosError$1.ERR_BAD_OPTION_VALUE : AxiosError$1.ERR_BAD_REQUEST;
+      throw new AxiosError$1(error.message, code);
+    }
+    throw error;
+  }
+}
+
 const DEFAULT_CHUNK_SIZE = 64 * 1024;
 
 const DEFAULT_REQUEST_OPTIONS = {
@@ -51462,11 +52288,13 @@ const factory = (env) => {
     {
       Request: globalObject.Request,
       Response: globalObject.Response,
+      Blob: globalObject.Blob,
     },
     env
   );
 
-  const { fetch: envFetch, Request, Response } = env;
+  const envFetch = utils$1.hasOwnProp(env, 'fetch') ? env.fetch : undefined;
+  const { Request, Response, Blob } = env;
   const isFetchSupported = envFetch ? isFunction(envFetch) : typeof fetch === 'function';
   const isRequestSupported = isFunction(Request);
   const isResponseSupported = isFunction(Response);
@@ -51515,6 +52343,20 @@ const factory = (env) => {
     isReadableStreamSupported &&
     test(() => utils$1.isReadableStream(new Response('').body));
 
+  // Some runtimes reject every explicit cache mode. Use own defaults for both
+  // probes so unrelated polluted options cannot affect cache-mode detection.
+  const requestDefaults = Object.assign(Object.create(null), DEFAULT_REQUEST_OPTIONS);
+
+  if (isRequestSupported && !test(() => new Request(platform.origin, requestDefaults))) {
+    delete requestDefaults.cache;
+
+    // Only omit cache when that makes Request construction succeed. Otherwise
+    // retain the explicit default that protects supporting runtimes from pollution.
+    if (!test(() => new Request(platform.origin, requestDefaults))) {
+      requestDefaults.cache = DEFAULT_REQUEST_OPTIONS.cache;
+    }
+  }
+
   const resolvers = {
     stream: supportsResponseStream && ((res) => res.body),
   };
@@ -51546,14 +52388,6 @@ const factory = (env) => {
 
     if (utils$1.isBlob(body)) {
       return body.size;
-    }
-
-    if (utils$1.isSpecCompliantForm(body)) {
-      const _request = new Request(platform.origin, {
-        method: 'POST',
-        body,
-      });
-      return (await _request.arrayBuffer()).byteLength;
     }
 
     if (utils$1.isArrayBufferView(body) || utils$1.isArrayBuffer(body)) {
@@ -51618,11 +52452,12 @@ const factory = (env) => {
 
     let requestContentLength;
 
-    // AxiosError we raise while the request body is being streamed. Captured
+    // AxiosErrors we raise while request or response bodies are being streamed. Captured
     // by identity so the catch block can surface it directly, regardless of
     // how the runtime wraps the resulting fetch rejection (undici exposes it
     // as `err.cause`; some browsers drop the original error entirely).
     let pendingBodyError = null;
+    let pendingResponseError = null;
 
     const maxBodyLengthError = () =>
       new AxiosError$1(
@@ -51646,8 +52481,9 @@ const factory = (env) => {
         };
       }
 
+      let parsedURL;
       if (maybeWithAuthCredentials(url)) {
-        const parsedURL = new URL(url, platform.origin);
+        parsedURL = new URL(url, platform.origin);
 
         if (!auth && (parsedURL.username || parsedURL.password)) {
           const urlUsername = decodeURIComponentSafe(parsedURL.username);
@@ -51676,8 +52512,8 @@ const factory = (env) => {
       // Enforce maxContentLength for data: URLs up-front so we never materialize
       // an oversized payload. The HTTP adapter applies the same check (see http.js
       // "if (protocol === 'data:')" branch).
-      if (hasMaxContentLength && typeof url === 'string' && url.startsWith('data:')) {
-        const estimated = estimateDataURLDecodedBytes(url);
+      if (hasMaxContentLength && parsedURL && parsedURL.protocol === 'data:') {
+        const estimated = estimateDataURLDecodedBytes(parsedURL.href);
         if (estimated > maxContentLength) {
           throw new AxiosError$1(
             'maxContentLength size of ' + maxContentLength + ' exceeded',
@@ -51686,6 +52522,38 @@ const factory = (env) => {
             request
           );
         }
+      }
+
+      const formContentType =
+        utils$1.isSpecCompliantForm(data) && AxiosHeaders$1.from(own('headers')).getContentType();
+      let formBoundary;
+      if (
+        utils$1.isString(formContentType) &&
+        /^multipart\/form-data(?:\s*;|$)/i.test(formContentType.trim())
+      ) {
+        const parameters = AxiosHeaders$1.parseParameters(formContentType);
+        if (utils$1.hasOwnProp(parameters, 'boundary')) formBoundary = parameters.boundary;
+      }
+
+      if (
+        utils$1.isSpecCompliantForm(data) &&
+        method !== 'get' &&
+        method !== 'head' &&
+        (hasMaxBodyLength ||
+          (onUploadProgress && supportsRequestStream) ||
+          formBoundary !== undefined)
+      ) {
+        data = createMultipartBody(
+          data,
+          Blob,
+          hasMaxBodyLength ? maxBodyLength : Infinity,
+          maxBodyLengthError,
+          formBoundary
+        );
+        // Blob.type lowercases its value, including a case-sensitive boundary.
+        // Retain the caller's header when an explicit boundary was serialized.
+        headers.setContentType(formBoundary === undefined ? data.type : formContentType);
+        requestContentLength = data.size;
       }
 
       // Enforce maxBodyLength against known-size bodies before dispatch using
@@ -51833,7 +52701,7 @@ const factory = (env) => {
       });
 
       if (isRequestSupported) {
-        utils$1.forEach(DEFAULT_REQUEST_OPTIONS, (value, key) => {
+        utils$1.forEach(requestDefaults, (value, key) => {
           if (resolvedOptions[key] === undefined) {
             resolvedOptions[key] = value;
           }
@@ -51907,12 +52775,12 @@ const factory = (env) => {
           if (hasMaxContentLength) {
             bytesRead = loadedBytes;
             if (bytesRead > maxContentLength) {
-              throw new AxiosError$1(
+              throw (pendingResponseError = new AxiosError$1(
                 'maxContentLength size of ' + maxContentLength + ' exceeded',
                 AxiosError$1.ERR_BAD_RESPONSE,
                 config,
                 request
-              );
+              ));
             }
           }
           onProgress && onProgress(loadedBytes);
@@ -51998,13 +52866,17 @@ const factory = (env) => {
       }
 
       // Surface a maxBodyLength violation we raised while the request body was
-      // being streamed. Matching by identity (rather than reading
+      // being streamed. Keeping the original error (rather than reading
       // `err.cause.isAxiosError`) keeps the error deterministic across runtimes
       // and avoids both prototype-pollution reads and mis-attributing a foreign
       // AxiosError that merely happened to land in `err.cause`.
       if (pendingBodyError) {
         request && !pendingBodyError.request && (pendingBodyError.request = request);
         throw pendingBodyError;
+      }
+
+      if (pendingResponseError) {
+        throw pendingResponseError;
       }
 
       // Re-throw AxiosErrors we raised synchronously (data: URL / content-length
@@ -52042,9 +52914,15 @@ const factory = (env) => {
 const seedCache = new Map();
 
 const getFetch = (config) => {
-  let env = (config && config.env) || {};
-  const { fetch, Request, Response } = env;
-  const seeds = [Request, Response, fetch];
+  const env = Object.create(null);
+  const configuredEnv = config && utils$1.hasOwnProp(config, 'env') && config.env;
+  ['fetch', 'Request', 'Response', 'Blob'].forEach((key) => {
+    if (configuredEnv && utils$1.hasOwnProp(configuredEnv, key)) {
+      env[key] = configuredEnv[key];
+    }
+  });
+  const { fetch, Request, Response, Blob } = env;
+  const seeds = [Request, Response, fetch, Blob];
 
   let len = seeds.length,
     i = len,
@@ -52211,6 +53089,37 @@ function throwIfCancellationRequested(config) {
 }
 
 /**
+ * Resolve the clock used to time adapter execution.
+ *
+ * Prefers the monotonic `performance.now()` so wall-clock adjustments do not
+ * skew the measurement, and so frameworks that forbid reading the current
+ * time during prerendering (e.g. Next.js Cache Components) accept it. Falls
+ * back to `Date.now()` in runtimes without the High Resolution Time API.
+ *
+ * @returns {() => number} Millisecond clock
+ */
+function resolveClock() {
+  return typeof performance !== 'undefined' && utils$1.isFunction(performance.now)
+    ? () => performance.now()
+    : Date.now;
+}
+
+/**
+ * Whole milliseconds elapsed since `start`, floored at zero.
+ *
+ * Rounded so the value stays an integer as with `Date.now()`. The fallback
+ * wall clock can move backwards mid-request, so the result is clamped.
+ *
+ * @param {() => number} now Clock returned by `resolveClock()`
+ * @param {number} start Timestamp read from `now`
+ *
+ * @returns {number} Non-negative elapsed milliseconds
+ */
+function elapsedSince(now, start) {
+  return Math.max(0, Math.round(now() - start));
+}
+
+/**
  * Dispatch a request to the server using the configured adapter.
  *
  * @param {object} config The config that is to be used for the request
@@ -52236,9 +53145,14 @@ function dispatchRequest(_config) {
 
   const adapter = adapters.getAdapter(config.adapter || defaults.adapter, config);
 
+  const now = resolveClock();
+  const start = now();
+
   return adapter(config).then(
     function onAdapterResolution(response) {
       throwIfCancellationRequested(config);
+
+      response.duration = elapsedSince(now, start);
 
       // Expose the current response on config so that transformResponse can
       // attach it to any AxiosError it throws (e.g. on JSON parse failure).
@@ -52260,6 +53174,7 @@ function dispatchRequest(_config) {
 
         // Transform response data
         if (reason && reason.response) {
+          reason.response.duration = elapsedSince(now, start);
           config.response = reason.response;
           try {
             reason.response.data = transformData.call(
@@ -52389,6 +53304,37 @@ var validator = {
 
 const validators = validator.validators;
 
+// Recognize header maps without consuming objects intended as literal values.
+// AxiosHeaders from other builds share a brand and header-container interface,
+// but not constructor identity. A tag and toJSON alone can describe a literal.
+const isHeadersBucket = (value) => {
+  if (value == null || utils$1.isPlainObject(value) || value instanceof AxiosHeaders$1) {
+    return true;
+  }
+
+  try {
+    return (
+      utils$1.isObject(value) &&
+      utils$1.getSafeProp(value, Symbol.toStringTag) === 'AxiosHeaders' &&
+      [
+        'toJSON',
+        'set',
+        'get',
+        'has',
+        'delete',
+        'clear',
+        'normalize',
+        'concat',
+        'toString',
+        Symbol.iterator,
+      ].every((method) => utils$1.isFunction(utils$1.getSafeProp(value, method)))
+    );
+  } catch (e) {
+    // A failed optional brand probe must not prevent literal header serialization.
+    return false;
+  }
+};
+
 /**
  * Create a new instance of Axios
  *
@@ -52435,16 +53381,26 @@ let Axios$1 = class Axios {
 
           if (!err.stack) {
             err.stack = stack;
-            // match without the 2 top stack lines
           } else if (stack) {
+            // Match a common suffix after the 2 top frames when available,
+            // otherwise compare the full reconstructed stack.
             const firstNewlineIndex = stack.indexOf('\n');
             const secondNewlineIndex =
               firstNewlineIndex === -1 ? -1 : stack.indexOf('\n', firstNewlineIndex + 1);
-            const stackWithoutTwoTopLines =
-              secondNewlineIndex === -1 ? '' : stack.slice(secondNewlineIndex + 1);
+            const duplicateCheckSuffix =
+              secondNewlineIndex === -1 ? stack : stack.slice(secondNewlineIndex + 1);
 
-            if (!String(err.stack).endsWith(stackWithoutTwoTopLines)) {
-              err.stack += '\n' + stack;
+            // `AxiosError.from()` may have already inlined the wrapped error's
+            // stack under a `Caused by:` marker. Keep the reconstructed caller
+            // frames ahead of that marker so stack-only reporters do not read
+            // them as part of the low-level cause.
+            const currentStack = String(err.stack);
+            const causeIndex = getCauseStackIndex(err, currentStack);
+            const stackHead = causeIndex === -1 ? currentStack : currentStack.slice(0, causeIndex);
+            const causeSection = causeIndex === -1 ? '' : currentStack.slice(causeIndex);
+
+            if (!stackHead.endsWith(duplicateCheckSuffix)) {
+              err.stack = stackHead + '\n' + stack + causeSection;
             }
           }
         } catch (e) {
@@ -52480,6 +53436,7 @@ let Axios$1 = class Axios {
           legacyInterceptorReqResOrdering: validators.transitional(validators.boolean),
           advertiseZstdAcceptEncoding: validators.transitional(validators.boolean),
           validateStatusUndefinedResolves: validators.transitional(validators.boolean),
+          encodeBasicAuthUsername: validators.transitional(validators.boolean),
         },
         false
       );
@@ -52503,7 +53460,10 @@ let Axios$1 = class Axios {
     }
 
     // Set config.allowAbsoluteUrls
-    if (config.allowAbsoluteUrls !== undefined) ; else if (this.defaults.allowAbsoluteUrls !== undefined) {
+    if (config.allowAbsoluteUrls !== undefined) ; else if (
+      utils$1.hasOwnProp(this.defaults, 'allowAbsoluteUrls') &&
+      this.defaults.allowAbsoluteUrls !== undefined
+    ) {
       config.allowAbsoluteUrls = this.defaults.allowAbsoluteUrls;
     } else {
       config.allowAbsoluteUrls = true;
@@ -52525,12 +53485,21 @@ let Axios$1 = class Axios {
       'get'
     ).toLowerCase();
 
-    // Flatten headers
-    let contextHeaders = headers && utils$1.merge(headers.common, headers[config.method]);
+    // Flatten header defaults without consuming literal method-named headers.
+    const commonHeaders = utils$1.getSafeProp(headers, 'common');
+    const methodHeaders = utils$1.getSafeProp(headers, config.method);
+    const contextHeaders =
+      headers &&
+      utils$1.merge(
+        isHeadersBucket(commonHeaders) ? commonHeaders : undefined,
+        isHeadersBucket(methodHeaders) ? methodHeaders : undefined
+      );
 
     headers &&
       utils$1.forEach(methodList.concat('common'), (method) => {
-        delete headers[method];
+        if (isHeadersBucket(utils$1.getSafeProp(headers, method))) {
+          delete headers[method];
+        }
       });
 
     config.headers = AxiosHeaders$1.concat(contextHeaders, headers);
@@ -52639,7 +53608,7 @@ let Axios$1 = class Axios {
 // Provide aliases for supported request methods
 utils$1.forEach(['delete', 'get', 'head', 'options'], function forEachMethodNoData(method) {
   /*eslint func-names:0*/
-  Axios$1.prototype[method] = function (url, config) {
+  Axios$1.prototype[method] = async function (url, config) {
     return this.request(
       mergeConfig$1(config || {}, {
         method,
@@ -52652,7 +53621,7 @@ utils$1.forEach(['delete', 'get', 'head', 'options'], function forEachMethodNoDa
 
 utils$1.forEach(['post', 'put', 'patch', 'query'], function forEachMethodWithData(method) {
   function generateHTTPMethod(isForm) {
-    return function httpMethod(url, data, config) {
+    return async function httpMethod(url, data, config) {
       return this.request(
         mergeConfig$1(config || {}, {
           method,
